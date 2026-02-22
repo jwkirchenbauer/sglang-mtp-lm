@@ -1911,6 +1911,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             decode_time = state.finished_time_perf - state.first_token_time_perf
             completion_tokens = recv_obj.completion_tokens[i]
             meta_info["decode_throughput"] = completion_tokens / decode_time
+            meta_info["decode_time"] = decode_time
 
     def _add_metric_if_present(
         self,
