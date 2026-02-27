@@ -277,6 +277,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Position information
     positions: torch.Tensor = None
+    decode_q_len_per_req: int = 1
+    mtp_emit_start_per_req: int = 0
+    mtp_emit_len_per_req: int = 1
+    mtp_phase: str = ""
+    mtp_debug_trace_enabled_per_req: Optional[List[bool]] = None
+    mtp_debug_step_idx_per_req: Optional[List[int]] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -383,6 +389,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
+            decode_q_len_per_req=batch.decode_q_len_per_req,
+            mtp_emit_start_per_req=batch.mtp_emit_start_per_req,
+            mtp_emit_len_per_req=batch.mtp_emit_len_per_req,
+            mtp_phase=batch.mtp_phase,
+            mtp_debug_trace_enabled_per_req=batch.mtp_debug_trace_enabled_per_req,
+            mtp_debug_step_idx_per_req=batch.mtp_debug_step_idx_per_req,
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
@@ -482,7 +494,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
-                ret.positions = clamp_position(batch.seq_lens)
+                if (
+                    ret.forward_mode.is_decode()
+                    and ret.decode_q_len_per_req > 1
+                    and len(batch.input_ids) == len(batch.seq_lens) * ret.decode_q_len_per_req
+                ):
+                    start_positions = batch.seq_lens - ret.decode_q_len_per_req
+                    pos_offsets = torch.arange(
+                        ret.decode_q_len_per_req, device=device, dtype=torch.int64
+                    )
+                    ret.positions = (
+                        start_positions.unsqueeze(1).to(torch.int64) + pos_offsets
+                    ).reshape(-1)
+                else:
+                    ret.positions = clamp_position(batch.seq_lens)
         else:
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)

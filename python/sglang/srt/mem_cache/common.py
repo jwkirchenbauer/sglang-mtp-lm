@@ -437,17 +437,30 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
+        req_last_loc = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices, batch.seq_lens - 1
         ]
-        seq_lens_next = batch.seq_lens + token_per_req
-        out_cache_loc = alloc_paged_token_slots_decode(
-            tree_cache=batch.tree_cache,
-            seq_lens=seq_lens_next,
-            seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
-            last_loc=last_loc,
-            token_per_req=token_per_req,
-        )
+        if token_per_req == 1:
+            out_cache_loc = alloc_paged_token_slots_decode(
+                tree_cache=batch.tree_cache,
+                seq_lens=batch.seq_lens + 1,
+                seq_lens_cpu=batch.seq_lens_cpu + 1,
+                last_loc=req_last_loc,
+                token_per_req=1,
+            )
+        else:
+            out_steps = []
+            for step in range(token_per_req):
+                step_out = alloc_paged_token_slots_decode(
+                    tree_cache=batch.tree_cache,
+                    seq_lens=batch.seq_lens + step + 1,
+                    seq_lens_cpu=batch.seq_lens_cpu + step + 1,
+                    last_loc=req_last_loc,
+                    token_per_req=1,
+                )
+                out_steps.append(step_out)
+                req_last_loc = step_out
+            out_cache_loc = torch.stack(out_steps, dim=1).reshape(-1)
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
@@ -455,9 +468,19 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         locs = batch.seq_lens.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+    if token_per_req == 1:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
+    else:
+        req_indices = batch.req_pool_indices.repeat_interleave(token_per_req)
+        loc_offsets = torch.arange(
+            token_per_req, device=locs.device, dtype=locs.dtype
+        ).repeat(bs)
+        write_locs = locs.repeat_interleave(token_per_req) + loc_offsets
+        batch.req_to_token_pool.write(
+            (req_indices, write_locs), out_cache_loc.to(torch.int32)
+        )
 
     return out_cache_loc
 
@@ -484,7 +507,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
-    if spec_algo is None:
+    if spec_algo is None and not getattr(req.sampling_params, "mtp_enabled", False):
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"

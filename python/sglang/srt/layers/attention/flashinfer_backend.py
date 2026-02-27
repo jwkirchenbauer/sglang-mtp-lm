@@ -423,18 +423,48 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
-            self.indices_updater_decode.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                decode_wrappers=self.decode_wrappers,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
-                fixed_split_size=self.decode_split_tile_size,
-                disable_split_kv=False,
-            )
-            self.forward_metadata = DecodeMetadata(self.decode_wrappers)
+            # For decode with multi-query rows (e.g., MTP k>1), use prefill-style
+            # planning so causal intra-row attention is honored.
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.decode_q_len_per_req > 1
+            ):
+                prefix_lens = forward_batch.seq_lens - forward_batch.decode_q_len_per_req
+                if torch.any(prefix_lens < 0):
+                    raise ValueError(
+                        "Invalid prefix lengths for decode-as-prefill path: "
+                        f"min(prefix_lens)={int(prefix_lens.min().item())}, "
+                        f"decode_q_len_per_req={forward_batch.decode_q_len_per_req}."
+                    )
+                self.indices_updater_prefill.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_lens_sum,
+                    prefix_lens,
+                    prefill_wrappers=self.prefill_wrappers_paged,
+                    use_ragged=False,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=forward_batch.spec_info,
+                    fixed_split_size=self.prefill_split_tile_size,
+                )
+                self.forward_metadata = PrefillMetadata(
+                    self.prefill_wrappers_paged, False, False
+                )
+            else:
+                self.indices_updater_decode.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_lens_sum,
+                    decode_q_len_per_req=forward_batch.decode_q_len_per_req,
+                    decode_wrappers=self.decode_wrappers,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=forward_batch.spec_info,
+                    fixed_split_size=self.decode_split_tile_size,
+                    disable_split_kv=False,
+                )
+                self.forward_metadata = DecodeMetadata(self.decode_wrappers)
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -575,6 +605,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens,
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
+                decode_q_len_per_req=1,
                 decode_wrappers=decode_wrappers,
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
@@ -697,6 +728,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
+                decode_q_len_per_req=1,
                 decode_wrappers=self.decode_cuda_graph_metadata[bs],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -868,6 +900,18 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        # Decode with q_len>1 may be planned using prefill wrappers to preserve
+        # causal intra-row attention semantics.
+        if isinstance(self.forward_metadata, PrefillMetadata):
+            return self.forward_extend(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=save_kv_cache,
+            )
+
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -945,6 +989,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
+        decode_q_len_per_req: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
@@ -960,6 +1005,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
+        decode_q_len_per_req: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
@@ -972,6 +1018,7 @@ class FlashInferIndicesUpdaterDecode:
             req_pool_indices,
             seq_lens,
             seq_lens_sum,
+            decode_q_len_per_req,
             self.kv_indptr[0],
             None,
             spec_info,
@@ -986,6 +1033,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
+        decode_q_len_per_req: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
@@ -1023,6 +1071,7 @@ class FlashInferIndicesUpdaterDecode:
                 req_pool_indices,
                 paged_kernel_lens_tmp,
                 paged_kernel_lens_sum_tmp,
+                decode_q_len_per_req,
                 self.kv_indptr[wrapper_id],
                 kv_start_idx_tmp,
                 spec_info,
@@ -1036,6 +1085,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
+        decode_q_len_per_req: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
@@ -1058,6 +1108,7 @@ class FlashInferIndicesUpdaterDecode:
                 req_pool_indices,
                 paged_kernel_lens,
                 seq_lens_sum,
+                decode_q_len_per_req,
                 self.kv_indptr[wrapper_id],
                 kv_start_idx,
                 spec_info,
@@ -1070,6 +1121,7 @@ class FlashInferIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
+        decode_q_len_per_req: int,
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
         spec_info: Optional[SpecInput],
@@ -1136,7 +1188,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                1,
+                decode_q_len_per_req,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
@@ -1155,7 +1207,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                1,
+                decode_q_len_per_req,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,

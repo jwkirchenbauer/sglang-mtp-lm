@@ -75,6 +75,7 @@ from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
+from sglang.srt.managers.schedule_batch import MTP_OVERLAP_ERROR_MSG
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -911,6 +912,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        if (
+            getattr(sampling_params, "mtp_enabled", False)
+            and not self.server_args.disable_overlap_schedule
+        ):
+            raise ValueError(MTP_OVERLAP_ERROR_MSG)
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
@@ -1591,8 +1597,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             state.finished = recv_obj.finished_reasons[i] is not None
             if state.finished:
                 state.finished_time = time.time()
-                state.finished_time_perf = time.perf_counter()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+
+                # Keep timing-field ordering consistent for finished requests:
+                # collect_metrics initializes first_token_time(_perf), which is required
+                # by _calculate_timing_metrics for decode_throughput/decode_time.
+                if self.enable_metrics and state.obj.log_metrics:
+                    self.collect_metrics(state, recv_obj, i)
+                state.finished_time_perf = time.perf_counter()
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
@@ -1615,7 +1627,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             state.event.set()
 
             # Log metrics and dump
-            if self.enable_metrics and state.obj.log_metrics:
+            if self.enable_metrics and state.obj.log_metrics and not state.finished:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
@@ -1909,9 +1921,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and recv_obj.completion_tokens[i] > 0
         ):
             decode_time = state.finished_time_perf - state.first_token_time_perf
-            completion_tokens = recv_obj.completion_tokens[i]
-            meta_info["decode_throughput"] = completion_tokens / decode_time
-            meta_info["decode_time"] = decode_time
+            if decode_time > 0.0:
+                completion_tokens = recv_obj.completion_tokens[i]
+                meta_info["decode_throughput"] = completion_tokens / decode_time
+                meta_info["decode_time"] = decode_time
 
     def _add_metric_if_present(
         self,
@@ -2418,9 +2431,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
         if state.first_token_time_perf and state.finished_time_perf:
-            span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE] = (
-                state.finished_time_perf - state.first_token_time_perf
-            )
+            decode_time = state.finished_time_perf - state.first_token_time_perf
+            if decode_time > 0.0:
+                span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_DECODE] = (
+                    decode_time
+                )
 
         if state.request_sent_to_scheduler_ts and state.finished_time:
             span_attrs[SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE] = (

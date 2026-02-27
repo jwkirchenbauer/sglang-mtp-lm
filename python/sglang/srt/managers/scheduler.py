@@ -142,6 +142,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    MTP_OVERLAP_ERROR_MSG,
     ModelWorkerBatch,
     MultimodalInputs,
     Req,
@@ -2048,9 +2049,55 @@ class Scheduler(
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
+        running_mtp_reqs = [
+            req
+            for req in self.running_batch.reqs
+            if getattr(req.sampling_params, "mtp_enabled", False)
+        ]
+        running_non_mtp_reqs = [
+            req
+            for req in self.running_batch.reqs
+            if not getattr(req.sampling_params, "mtp_enabled", False)
+        ]
+        if running_mtp_reqs and running_non_mtp_reqs:
+            raise ValueError(
+                "Running decode batch contains mixed MTP-enabled and non-MTP requests."
+            )
+        running_mtp_phase = None
+        running_mtp_k = None
+        if running_mtp_reqs:
+            running_mtp_phase_set = {req.mtp_phase for req in running_mtp_reqs}
+            running_mtp_k_set = {req.sampling_params.mtp_k for req in running_mtp_reqs}
+            if len(running_mtp_phase_set) != 1 or len(running_mtp_k_set) != 1:
+                raise ValueError(
+                    f"Running decode batch has mixed MTP settings: {running_mtp_phase_set=}, {running_mtp_k_set=}"
+                )
+            running_mtp_phase = next(iter(running_mtp_phase_set))
+            running_mtp_k = next(iter(running_mtp_k_set))
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            req_is_mtp = getattr(req.sampling_params, "mtp_enabled", False)
+            if running_mtp_reqs:
+                if not req_is_mtp:
+                    continue
+                if req.sampling_params.mtp_k != running_mtp_k:
+                    continue
+                if req.mtp_phase != running_mtp_phase:
+                    continue
+            elif running_non_mtp_reqs and req_is_mtp:
+                continue
+            elif adder.can_run_list:
+                first_req = adder.can_run_list[0]
+                first_is_mtp = getattr(first_req.sampling_params, "mtp_enabled", False)
+                if req_is_mtp != first_is_mtp:
+                    continue
+                if req_is_mtp:
+                    if req.sampling_params.mtp_k != first_req.sampling_params.mtp_k:
+                        continue
+                    if req.mtp_phase != first_req.mtp_phase:
+                        continue
+
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
@@ -2203,6 +2250,10 @@ class Scheduler(
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
+        if self.enable_overlap and any(
+            getattr(req.sampling_params, "mtp_enabled", False) for req in batch.reqs
+        ):
+            raise ValueError(MTP_OVERLAP_ERROR_MSG)
 
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():

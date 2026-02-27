@@ -104,6 +104,11 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
 
+MTP_OVERLAP_ERROR_MSG = (
+    "MTP currently requires overlap scheduler to be disabled. "
+    "Start server with --disable-overlap-schedule."
+)
+
 
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
@@ -567,6 +572,17 @@ class Req(ReqDllmMixin):
         self.kv_allocated_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.mtp_phase: str = "seed"
+        self.mtp_prev_step_cache_loc: Optional[torch.Tensor] = None
+        self.mtp_pending_tokens: List[int] = []
+        self.mtp_effective_k: int = 1
+        self.mtp_commit_len: int = 0
+        self.mtp_seed_anchor_adjusted: bool = False
+        self.mtp_seed_anchor_old_last_loc: Optional[int] = None
+        self.mtp_debug_trace_enabled: bool = False
+        self.mtp_debug_max_steps: int = 4
+        self.mtp_debug_trace: List[Dict[str, Any]] = []
+        self.mtp_debug_logged_first_argmax: bool = False
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -595,6 +611,23 @@ class Req(ReqDllmMixin):
                 "__req__": self
             }
         self.sampling_params = sampling_params
+        self.mtp_effective_k = (
+            self.sampling_params.mtp_k
+            if getattr(self.sampling_params, "mtp_enabled", False)
+            else 1
+        )
+        custom_params = (
+            self.sampling_params.custom_params
+            if isinstance(self.sampling_params.custom_params, dict)
+            else {}
+        )
+        self.mtp_debug_trace_enabled = bool(custom_params.get("mtp_debug_trace", False))
+        self.mtp_debug_max_steps = int(custom_params.get("mtp_debug_max_steps", 4))
+        if self.mtp_debug_max_steps < 1:
+            self.mtp_debug_max_steps = 1
+        if stream:
+            # Keep response format stable for streaming requests.
+            self.mtp_debug_trace_enabled = False
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
 
@@ -817,6 +850,51 @@ class Req(ReqDllmMixin):
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
+
+    @staticmethod
+    def _mtp_debug_cap_token_ids(token_ids: List[int], max_items: int = 16) -> List[int]:
+        return [int(x) for x in token_ids[:max_items]]
+
+    def _mtp_debug_decode_token_ids(self, token_ids: List[int]) -> str:
+        if not token_ids:
+            return ""
+        if self.tokenizer is None:
+            return ""
+        try:
+            return self.tokenizer.decode(
+                token_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except Exception:
+            # Debug-only path: never fail request processing because of trace decoding.
+            return ""
+
+    def mtp_debug_upsert_step(self, step_idx: int, fields: Dict[str, Any]) -> None:
+        if not self.mtp_debug_trace_enabled:
+            return
+
+        entry = None
+        for item in self.mtp_debug_trace:
+            if item.get("step_idx") == step_idx:
+                entry = item
+                break
+
+        if entry is None:
+            if len(self.mtp_debug_trace) >= self.mtp_debug_max_steps:
+                return
+            entry = {"step_idx": int(step_idx)}
+            self.mtp_debug_trace.append(entry)
+
+        for k, v in fields.items():
+            entry[k] = v
+            if (
+                isinstance(v, list)
+                and v
+                and all(isinstance(x, int) for x in v)
+                and not k.endswith("_decoded")
+            ):
+                entry[f"{k}_decoded"] = self._mtp_debug_decode_token_ids(v)
 
     @property
     def is_prefill_only(self) -> bool:
@@ -1090,6 +1168,9 @@ class Req(ReqDllmMixin):
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
 
+        if new_accepted_len <= 0:
+            return
+
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         if self._check_token_based_finish(new_accepted_tokens):
@@ -1128,6 +1209,17 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.mtp_phase = "seed"
+        self.mtp_prev_step_cache_loc = None
+        self.mtp_pending_tokens = []
+        self.mtp_effective_k = (
+            self.sampling_params.mtp_k
+            if getattr(self.sampling_params, "mtp_enabled", False)
+            else 1
+        )
+        self.mtp_commit_len = 0
+        self.mtp_seed_anchor_adjusted = False
+        self.mtp_seed_anchor_old_last_loc = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1234,6 +1326,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
+    decode_q_len_per_req: int = 1
+    mtp_emit_start_per_req: int = 0
+    mtp_emit_len_per_req: int = 1
+    mtp_phase: str = ""
+    mtp_debug_trace_enabled_per_req: Optional[List[bool]] = None
+    mtp_debug_step_idx_per_req: Optional[List[int]] = None
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -1933,6 +2031,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
+        self.decode_q_len_per_req = 1
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
@@ -1947,7 +2046,123 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        mtp_enabled_reqs = [
+            req for req in self.reqs if getattr(req.sampling_params, "mtp_enabled", False)
+        ]
+        mtp_ks = [req.sampling_params.mtp_k for req in mtp_enabled_reqs]
+        mtp_phases = [req.mtp_phase for req in mtp_enabled_reqs]
+
+        # One-time MTP seed anchor correction:
+        # In seed phase for k>1, we recompute the last prompt token, so the logical
+        # decode base should be prompt_len - 1 (HF parity).
+        if mtp_enabled_reqs:
+            for req in mtp_enabled_reqs:
+                if (
+                    req.sampling_params.mtp_k > 1
+                    and req.mtp_phase == "seed"
+                    and not req.mtp_seed_anchor_adjusted
+                ):
+                    if self.tree_cache.page_size != 1:
+                        raise ValueError(
+                            "MTP seed anchor correction currently supports page_size==1 only."
+                        )
+                    if req.kv_committed_len < 1:
+                        raise ValueError(
+                            f"Invalid kv_committed_len for MTP seed anchor correction: {req.kv_committed_len}"
+                        )
+                    if req.req_pool_idx is None:
+                        raise ValueError(
+                            f"Request {req.rid} has no req_pool_idx during MTP seed anchor correction."
+                        )
+
+                    old_last_pos = req.kv_committed_len - 1
+                    old_last_loc = int(
+                        self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, old_last_pos
+                        ].item()
+                    )
+                    self.token_to_kv_pool_allocator.free(
+                        torch.tensor([old_last_loc], dtype=torch.int64, device=self.device)
+                    )
+                    req.kv_committed_len -= 1
+                    req.kv_allocated_len -= 1
+                    if req.kv_allocated_len < req.kv_committed_len:
+                        raise ValueError(
+                            "Invalid KV lengths after MTP seed anchor correction: "
+                            f"{req.kv_committed_len=} > {req.kv_allocated_len=}"
+                        )
+                    req.mtp_seed_anchor_adjusted = True
+                    req.mtp_seed_anchor_old_last_loc = old_last_loc
+
+        if not self.model_config.is_encoder_decoder:
+            if mtp_enabled_reqs:
+                # For MTP delayed-commit decode, logical decode base length must follow
+                # committed KV cache length, not emitted token count.
+                seq_lens_list = [req.kv_committed_len for req in self.reqs]
+            else:
+                seq_lens_list = [req.seqlen for req in self.reqs]
+            self.seq_lens = torch.tensor(
+                seq_lens_list, dtype=torch.int64, device=self.device
+            )
+            self.seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int64)
+            self.orig_seq_lens = torch.tensor(
+                seq_lens_list, dtype=torch.int32, device=self.device
+            )
+            self.seq_lens_sum = int(sum(seq_lens_list))
+
         bs = len(self.reqs)
+        token_per_req = 1
+        mtp_emit_start = 0
+        mtp_emit_len = 1
+        if mtp_enabled_reqs:
+            if get_global_server_args().attention_backend != "flashinfer":
+                raise ValueError(
+                    "MTP decode currently supports only the flashinfer attention backend."
+                )
+            if len(mtp_enabled_reqs) != len(self.reqs):
+                raise ValueError(
+                    "Mixing MTP-enabled and non-MTP requests in the same decode batch is not supported yet."
+                )
+            if len(set(mtp_ks)) != 1:
+                raise ValueError(
+                    f"Mixed mtp_k in the same decode batch is not supported yet: {sorted(set(mtp_ks))}"
+                )
+            if len(set(mtp_phases)) != 1:
+                raise ValueError(
+                    f"Mixed mtp_phase in the same decode batch is not supported yet: {sorted(set(mtp_phases))}"
+                )
+            mtp_k = mtp_ks[0]
+            if mtp_phases[0] == "seed":
+                token_per_req = mtp_k
+                mtp_emit_start = 0
+                mtp_emit_len = mtp_k
+            elif mtp_phases[0] == "steady":
+                token_per_req = 2 * mtp_k - 1
+                mtp_emit_start = mtp_k - 1
+                mtp_emit_len = mtp_k
+            else:
+                raise ValueError(f"Invalid mtp_phase: {mtp_phases[0]}")
+            if mtp_emit_len != mtp_k:
+                raise ValueError(
+                    f"MTP emit length must equal mtp_k. Got emit_len={mtp_emit_len}, mtp_k={mtp_k}."
+                )
+        if mtp_emit_start < 0 or mtp_emit_start >= token_per_req:
+            raise ValueError(
+                f"Invalid MTP emit start {mtp_emit_start} for token_per_req={token_per_req}."
+            )
+        if mtp_emit_start + mtp_emit_len > token_per_req:
+            raise ValueError(
+                "Invalid MTP emit window: "
+                f"start={mtp_emit_start}, len={mtp_emit_len}, token_per_req={token_per_req}."
+            )
+        self.decode_q_len_per_req = token_per_req
+        self.mtp_emit_start_per_req = mtp_emit_start
+        self.mtp_emit_len_per_req = mtp_emit_len
+        self.mtp_phase = mtp_phases[0] if mtp_enabled_reqs else ""
+        self.mtp_debug_trace_enabled_per_req = [
+            bool(getattr(req, "mtp_debug_trace_enabled", False)) for req in self.reqs
+        ]
+        self.mtp_debug_step_idx_per_req = [int(req.decode_batch_idx) for req in self.reqs]
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
@@ -1983,33 +2198,111 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
 
         # Update fields
-        self.input_ids = self.output_ids
+        if mtp_enabled_reqs:
+            mask_rows = []
+            for i, req in enumerate(self.reqs):
+                row = []
+                mtp_k = req.sampling_params.mtp_k
+                req.mtp_effective_k = mtp_k
+
+                if req.mtp_phase == "seed":
+                    if isinstance(self.output_ids, torch.Tensor):
+                        if self.output_ids.ndim == 1:
+                            last_token = int(self.output_ids[i].item())
+                        else:
+                            last_token = int(self.output_ids[i, -1].item())
+                    else:
+                        out = self.output_ids[i]
+                        last_token = int(out[-1] if isinstance(out, list) else out)
+                    row.append(last_token)
+                    req.mtp_commit_len = 1
+                else:
+                    if len(req.mtp_pending_tokens) != mtp_k:
+                        raise ValueError(
+                            f"MTP steady phase requires {mtp_k} pending tokens, got {len(req.mtp_pending_tokens)}."
+                        )
+                    row.extend(req.mtp_pending_tokens)
+                    req.mtp_commit_len = mtp_k
+
+                # Use a mask range if provided, otherwise a single mask id repeated.
+                if req.sampling_params.mtp_min_mask_id is not None:
+                    min_mask = req.sampling_params.mtp_min_mask_id
+                    max_mask = req.sampling_params.mtp_max_mask_id
+                    if max_mask is None:
+                        raise ValueError(
+                            "mtp_max_mask_id must be provided when mtp_min_mask_id is used."
+                        )
+                    for offset in range(mtp_k - 1):
+                        mask_id = min_mask + offset
+                        if mask_id > max_mask:
+                            raise ValueError(
+                                f"Mask range exhausted for mtp_k={mtp_k}: {mask_id=} > {max_mask=}."
+                            )
+                        row.append(mask_id)
+                else:
+                    assert req.sampling_params.mtp_mask_id is not None
+                    row.extend([req.sampling_params.mtp_mask_id] * (mtp_k - 1))
+
+                if len(row) != token_per_req:
+                    raise ValueError(
+                        f"Unexpected MTP decode row length {len(row)} for req {req.rid}, expected {token_per_req}."
+                    )
+                req.mtp_debug_upsert_step(
+                    req.decode_batch_idx,
+                    {
+                        "phase": req.mtp_phase,
+                        "decode_q_len_per_req": int(token_per_req),
+                        "seed_anchor_adjusted": bool(req.mtp_seed_anchor_adjusted),
+                        "kv_committed_len_effective_base": int(
+                            self.seq_lens_cpu[i].item()
+                        ),
+                        "input_row_token_ids": req._mtp_debug_cap_token_ids(row),
+                        "emit_window": {
+                            "start": int(self.mtp_emit_start_per_req),
+                            "len": int(self.mtp_emit_len_per_req),
+                        },
+                        "seq_len_base_used_for_next_decode": int(
+                            self.seq_lens_cpu[i].item()
+                        ),
+                    },
+                )
+                mask_rows.append(row)
+
+            self.input_ids = torch.tensor(
+                mask_rows, dtype=torch.int64, device=self.device
+            ).reshape(-1)
+        elif isinstance(self.output_ids, torch.Tensor) and self.output_ids.ndim > 1:
+            # Multi-token outputs are flattened to feed decode kernels.
+            self.input_ids = self.output_ids.reshape(-1)
+        else:
+            self.input_ids = self.output_ids
         self.output_ids = None
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
         # Allocate memory
-        self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        self.out_cache_loc = alloc_for_decode(self, token_per_req=token_per_req)
 
         # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
-            req.kv_committed_len += 1
-            req.kv_allocated_len += 1
+            req.kv_allocated_len += token_per_req
+            if not getattr(req.sampling_params, "mtp_enabled", False):
+                req.kv_committed_len += token_per_req
 
         # Update seq_lens after allocation
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
-            self.seq_lens = self.seq_lens + 1
-            self.seq_lens_cpu = self.seq_lens_cpu + 1
-            self.orig_seq_lens = self.orig_seq_lens + 1
+            self.seq_lens = self.seq_lens + token_per_req
+            self.seq_lens_cpu = self.seq_lens_cpu + token_per_req
+            self.orig_seq_lens = self.orig_seq_lens + token_per_req
         else:
             # A faster in-place version
-            self.seq_lens.add_(1)
-            self.seq_lens_cpu.add_(1)
-            self.orig_seq_lens.add_(1)
-        self.seq_lens_sum += bs
+            self.seq_lens.add_(token_per_req)
+            self.seq_lens_cpu.add_(token_per_req)
+            self.orig_seq_lens.add_(token_per_req)
+        self.seq_lens_sum += bs * token_per_req
 
         if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
@@ -2185,6 +2478,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ModelWorkerBatch(
             forward_mode=self.forward_mode,
             input_ids=self.input_ids,
+            decode_q_len_per_req=self.decode_q_len_per_req,
+            mtp_emit_start_per_req=self.mtp_emit_start_per_req,
+            mtp_emit_len_per_req=self.mtp_emit_len_per_req,
+            mtp_phase=self.mtp_phase,
+            mtp_debug_trace_enabled_per_req=self.mtp_debug_trace_enabled_per_req,
+            mtp_debug_step_idx_per_req=self.mtp_debug_step_idx_per_req,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
             orig_seq_lens=self.orig_seq_lens,
@@ -2248,6 +2547,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             model_config=self.model_config,
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
+            decode_q_len_per_req=self.decode_q_len_per_req,
+            mtp_emit_start_per_req=self.mtp_emit_start_per_req,
+            mtp_emit_len_per_req=self.mtp_emit_len_per_req,
+            mtp_phase=self.mtp_phase,
+            mtp_debug_trace_enabled_per_req=self.mtp_debug_trace_enabled_per_req,
+            mtp_debug_step_idx_per_req=self.mtp_debug_step_idx_per_req,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
@@ -2283,7 +2588,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
                     # 2. Evict swa every window_size tokens to reduce the overhead.
                     if req.decode_batch_idx % sliding_window_size == 1:
-                        self._evict_swa(req, req.seqlen - 1)
+                        decode_pre_len = (
+                            req.kv_committed_len
+                            if getattr(req.sampling_params, "mtp_enabled", False)
+                            else req.seqlen
+                        )
+                        self._evict_swa(req, decode_pre_len - 1)
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
@@ -2339,6 +2649,7 @@ class ModelWorkerBatch:
     forward_mode: ForwardMode
     # The input ids
     input_ids: torch.Tensor
+    decode_q_len_per_req: int
     # The indices of requests in the req_to_token_pool
     req_pool_indices: torch.Tensor
     # The sequence length
@@ -2383,6 +2694,13 @@ class ModelWorkerBatch:
 
     # Sampling info
     sampling_info: SamplingBatchInfo
+
+    # Phase-aware MTP token emission window for decode.
+    mtp_emit_start_per_req: int = 0
+    mtp_emit_len_per_req: int = 1
+    mtp_phase: str = ""
+    mtp_debug_trace_enabled_per_req: Optional[List[bool]] = None
+    mtp_debug_step_idx_per_req: Optional[List[int]] = None
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: Optional[torch.Tensor] = None

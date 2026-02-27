@@ -105,6 +105,9 @@ class LogitsProcessorOutput:
     customized_info: Optional[Dict[str, List[Any]]] = None
 
     mm_input_embeds: Optional[torch.Tensor] = None
+    # MTP decode internals: committed tokens (for output) and pending tokens (for next step).
+    mtp_committed_token_ids: Optional[torch.Tensor] = None
+    mtp_pending_token_ids: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass

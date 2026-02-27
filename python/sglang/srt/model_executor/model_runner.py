@@ -2457,6 +2457,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
+            and forward_batch.decode_q_len_per_req == 1
         )
 
         if can_run_graph:
@@ -2547,6 +2548,210 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        logits = logits_output.next_token_logits
+        if logits is not None:
+
+            def _cap_row(t: torch.Tensor) -> List[int]:
+                return [int(x) for x in t[:16].tolist()]
+
+            positions_rows = None
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.positions is not None
+                and forward_batch.positions.ndim == 1
+            ):
+                bs_for_pos = forward_batch.batch_size
+                q_len_for_pos = max(1, int(forward_batch.decode_q_len_per_req))
+                if (
+                    bs_for_pos > 0
+                    and forward_batch.positions.shape[0] == bs_for_pos * q_len_for_pos
+                ):
+                    positions_rows = forward_batch.positions.reshape(
+                        bs_for_pos, q_len_for_pos
+                    )
+
+            # Keep mtp_enabled=true on the MTP runtime path even for k=1.
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.decode_q_len_per_req == 1
+                and bool(forward_batch.mtp_phase)
+            ):
+                bs = forward_batch.batch_size
+                if logits.ndim == 2:
+                    if bs <= 0 or logits.shape[0] != bs:
+                        raise ValueError(
+                            "MTP decode logits shape mismatch for q_len=1. "
+                            f"Expected [{bs}, vocab], got {tuple(logits.shape)}."
+                        )
+                    token_ids = torch.argmax(logits, dim=-1).view(bs, 1).to(torch.int32)
+                elif logits.ndim == 3:
+                    if logits.shape[0] != bs or logits.shape[1] != 1:
+                        raise ValueError(
+                            "MTP decode logits shape mismatch for rank-3 q_len=1 logits. "
+                            f"Expected [{bs}, 1, vocab], got {tuple(logits.shape)}."
+                        )
+                    token_ids = torch.argmax(logits, dim=-1).to(torch.int32)
+                else:
+                    raise ValueError(
+                        f"Unsupported logits rank {logits.ndim} for MTP decode q_len=1."
+                    )
+
+                logits_output.mtp_committed_token_ids = token_ids
+                logits_output.mtp_pending_token_ids = token_ids
+
+                if (
+                    forward_batch.mtp_debug_trace_enabled_per_req is not None
+                    and any(forward_batch.mtp_debug_trace_enabled_per_req)
+                ):
+                    if logits_output.customized_info is None:
+                        logits_output.customized_info = {}
+                    step_idxs = forward_batch.mtp_debug_step_idx_per_req or [-1] * bs
+                    sample_debug = [None] * bs
+                    for i in range(bs):
+                        if not forward_batch.mtp_debug_trace_enabled_per_req[i]:
+                            continue
+                        sample_debug[i] = {
+                            "step_idx": int(step_idxs[i]),
+                            "argmax_row_token_ids": _cap_row(token_ids[i]),
+                            "pending_token_ids": _cap_row(token_ids[i]),
+                            "committed_token_ids": _cap_row(token_ids[i]),
+                            "positions_row": (
+                                _cap_row(positions_rows[i])
+                                if positions_rows is not None
+                                else []
+                            ),
+                            "logits_shape": [int(x) for x in logits.shape],
+                        }
+                    logits_output.customized_info["mtp_debug_sample"] = sample_debug
+
+                return token_ids
+
+            # MTP decode uses a phase-aware emission window over per-request q_len logits.
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.decode_q_len_per_req > 1
+            ):
+                bs = forward_batch.batch_size
+                q_len = forward_batch.decode_q_len_per_req
+                emit_start = forward_batch.mtp_emit_start_per_req
+                emit_len = forward_batch.mtp_emit_len_per_req
+                emit_end = emit_start + emit_len
+
+                if emit_start < 0 or emit_start >= q_len or emit_end > q_len:
+                    raise ValueError(
+                        "Invalid decode emit window for MTP: "
+                        f"start={emit_start}, len={emit_len}, q_len={q_len}."
+                    )
+
+                if logits.ndim == 2:
+                    if bs <= 0 or logits.shape[0] != bs * q_len:
+                        raise ValueError(
+                            "MTP decode logits shape mismatch for flattened logits. "
+                            f"Expected [{bs * q_len}, vocab], got {tuple(logits.shape)} "
+                            f"with batch_size={bs}, q_len={q_len}."
+                        )
+                    token_ids = torch.argmax(logits, dim=-1).view(bs, q_len)
+                    pending_ids = token_ids[:, emit_start:emit_end].to(torch.int32)
+                    if forward_batch.mtp_phase == "steady":
+                        logits_output.mtp_committed_token_ids = token_ids[
+                            :, : emit_start + 1
+                        ].to(torch.int32)
+                    else:
+                        logits_output.mtp_committed_token_ids = torch.empty(
+                            (bs, 0), dtype=torch.int32, device=token_ids.device
+                        )
+                    logits_output.mtp_pending_token_ids = pending_ids
+                    if (
+                        forward_batch.mtp_debug_trace_enabled_per_req is not None
+                        and any(forward_batch.mtp_debug_trace_enabled_per_req)
+                    ):
+                        if logits_output.customized_info is None:
+                            logits_output.customized_info = {}
+                        step_idxs = forward_batch.mtp_debug_step_idx_per_req or [
+                            -1
+                        ] * bs
+                        sample_debug = [None] * bs
+                        for i in range(bs):
+                            if not forward_batch.mtp_debug_trace_enabled_per_req[i]:
+                                continue
+                            sample_debug[i] = {
+                                "step_idx": int(step_idxs[i]),
+                                "argmax_row_token_ids": _cap_row(token_ids[i]),
+                                "pending_token_ids": _cap_row(pending_ids[i]),
+                                "committed_token_ids": _cap_row(
+                                    logits_output.mtp_committed_token_ids[i]
+                                ),
+                                "positions_row": (
+                                    _cap_row(positions_rows[i])
+                                    if positions_rows is not None
+                                    else []
+                                ),
+                                "logits_shape": [int(x) for x in logits.shape],
+                            }
+                        logits_output.customized_info["mtp_debug_sample"] = sample_debug
+                    return pending_ids
+
+                if logits.ndim == 3:
+                    if logits.shape[0] != bs or logits.shape[1] != q_len:
+                        raise ValueError(
+                            "MTP decode logits shape mismatch for rank-3 logits. "
+                            f"Expected [{bs}, {q_len}, vocab], got {tuple(logits.shape)}."
+                        )
+                    token_ids = torch.argmax(logits, dim=-1)
+                    pending_ids = token_ids[:, emit_start:emit_end].to(torch.int32)
+                    if forward_batch.mtp_phase == "steady":
+                        logits_output.mtp_committed_token_ids = token_ids[
+                            :, : emit_start + 1
+                        ].to(torch.int32)
+                    else:
+                        logits_output.mtp_committed_token_ids = torch.empty(
+                            (bs, 0), dtype=torch.int32, device=token_ids.device
+                        )
+                    logits_output.mtp_pending_token_ids = pending_ids
+                    if (
+                        forward_batch.mtp_debug_trace_enabled_per_req is not None
+                        and any(forward_batch.mtp_debug_trace_enabled_per_req)
+                    ):
+                        if logits_output.customized_info is None:
+                            logits_output.customized_info = {}
+                        step_idxs = forward_batch.mtp_debug_step_idx_per_req or [
+                            -1
+                        ] * bs
+                        sample_debug = [None] * bs
+                        for i in range(bs):
+                            if not forward_batch.mtp_debug_trace_enabled_per_req[i]:
+                                continue
+                            sample_debug[i] = {
+                                "step_idx": int(step_idxs[i]),
+                                "argmax_row_token_ids": _cap_row(token_ids[i]),
+                                "pending_token_ids": _cap_row(pending_ids[i]),
+                                "committed_token_ids": _cap_row(
+                                    logits_output.mtp_committed_token_ids[i]
+                                ),
+                                "positions_row": (
+                                    _cap_row(positions_rows[i])
+                                    if positions_rows is not None
+                                    else []
+                                ),
+                                "logits_shape": [int(x) for x in logits.shape],
+                            }
+                        logits_output.customized_info["mtp_debug_sample"] = sample_debug
+                    return pending_ids
+
+                raise ValueError(
+                    f"Unsupported logits rank {logits.ndim} for MTP decode."
+                )
+
+            if logits.ndim == 3:
+                return torch.argmax(logits, dim=-1).to(torch.int32)
+            if logits.ndim == 2:
+                bs = forward_batch.batch_size
+                if bs > 0 and logits.shape[0] % bs == 0:
+                    k = logits.shape[0] // bs
+                    if k > 1:
+                        mtp_next = torch.argmax(logits, dim=-1).view(bs, k)
+                        return mtp_next.to(torch.int32)
+
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,

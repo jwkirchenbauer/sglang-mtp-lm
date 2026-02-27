@@ -117,6 +117,9 @@ class SchedulerOutputProcessorMixin:
             if req.customized_info is None:
                 req.customized_info = {}
             for k, v in logits_output.customized_info.items():
+                if k == "mtp_debug_sample":
+                    # Internal transport key consumed by MTP debug trace aggregation.
+                    continue
                 if k not in req.customized_info:
                     req.customized_info[k] = []
                 # Copy the element so it doesn't retain the entire batch
@@ -436,13 +439,45 @@ class SchedulerOutputProcessorMixin:
         )
 
         if batch.spec_algorithm.is_none():
-            next_token_ids = next_token_ids.tolist()
-            if batch.return_logprob:
+            if isinstance(next_token_ids, torch.Tensor):
+                next_token_ids = next_token_ids.tolist()
+            if batch.return_logprob and logits_output.next_token_logprobs is not None:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
-        self.num_generated_tokens += len(batch.reqs)
+        mtp_committed_token_ids = None
+        if (
+            batch.spec_algorithm.is_none()
+            and logits_output is not None
+            and getattr(logits_output, "mtp_committed_token_ids", None) is not None
+        ):
+            mtp_committed_token_ids = logits_output.mtp_committed_token_ids
+            if isinstance(mtp_committed_token_ids, torch.Tensor):
+                mtp_committed_token_ids = mtp_committed_token_ids.tolist()
+        mtp_sample_debug = None
+        if (
+            logits_output is not None
+            and logits_output.customized_info is not None
+            and isinstance(logits_output.customized_info.get("mtp_debug_sample"), list)
+        ):
+            mtp_sample_debug = logits_output.customized_info["mtp_debug_sample"]
+
+        if batch.spec_algorithm.is_none():
+            total_generated = 0
+            for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                if getattr(req.sampling_params, "mtp_enabled", False):
+                    committed_ids = (
+                        mtp_committed_token_ids[i]
+                        if mtp_committed_token_ids is not None
+                        else []
+                    )
+                    total_generated += len(committed_ids)
+                else:
+                    total_generated += len(next_token_id) if isinstance(next_token_id, list) else 1
+            self.num_generated_tokens += total_generated
+        else:
+            self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
         if self.enable_metrics:
@@ -463,9 +498,54 @@ class SchedulerOutputProcessorMixin:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
+            is_mtp_req = (
+                batch.spec_algorithm.is_none()
+                and getattr(req.sampling_params, "mtp_enabled", False)
+            )
+            debug_step_idx = req.decode_batch_idx - 1
+            kv_committed_len_before = int(req.kv_committed_len)
+            kv_allocated_len_before = int(req.kv_allocated_len)
+            req_q_len = batch.decode_q_len_per_req if is_mtp_req else 1
+            curr_step_cache_loc = None
+            if is_mtp_req:
+                start = i * req_q_len
+                curr_step_cache_loc = batch.out_cache_loc[start : start + req_q_len]
+
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
+                if is_mtp_req:
+                    committed_ids = (
+                        mtp_committed_token_ids[i]
+                        if mtp_committed_token_ids is not None
+                        else []
+                    )
+                    if req.sampling_params.mtp_k == 1 and len(committed_ids) == 0:
+                        # Defensive fallback: k=1 must always commit one token.
+                        if isinstance(next_token_id, list):
+                            if len(next_token_id) > 0:
+                                committed_ids = [int(next_token_id[0])]
+                        else:
+                            committed_ids = [int(next_token_id)]
+                    if committed_ids:
+                        req.output_ids.extend(int(x) for x in committed_ids)
+                        new_accepted_len = len(committed_ids)
+                    else:
+                        new_accepted_len = 0
+                    if (
+                        req.sampling_params.mtp_k == 1
+                        and new_accepted_len != 1
+                        and not req.finished()
+                        and not req.is_retracted
+                    ):
+                        raise ValueError(
+                            "MTP k=1 decode must commit exactly one token per step. "
+                            f"rid={req.rid}, got new_accepted_len={new_accepted_len}."
+                        )
+                elif isinstance(next_token_id, list):
+                    req.output_ids.extend(next_token_id)
+                    new_accepted_len = len(next_token_id)
+                else:
+                    req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
@@ -474,9 +554,111 @@ class SchedulerOutputProcessorMixin:
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
 
+            if is_mtp_req:
+                if mtp_sample_debug is not None and mtp_sample_debug[i] is not None:
+                    sample_entry = mtp_sample_debug[i]
+                    req.mtp_debug_upsert_step(
+                        int(sample_entry.get("step_idx", debug_step_idx)),
+                        {
+                            "argmax_row_token_ids": sample_entry.get(
+                                "argmax_row_token_ids", []
+                            ),
+                            "pending_token_ids": sample_entry.get(
+                                "pending_token_ids", []
+                            ),
+                            "committed_token_ids": sample_entry.get(
+                                "committed_token_ids", []
+                            ),
+                            "positions_row": sample_entry.get("positions_row", []),
+                            "logits_shape": sample_entry.get("logits_shape", []),
+                        },
+                    )
+                    if (
+                        getattr(req, "mtp_debug_trace_enabled", False)
+                        and debug_step_idx == 0
+                        and not getattr(req, "mtp_debug_logged_first_argmax", False)
+                    ):
+                        input_ids = []
+                        for item in req.mtp_debug_trace:
+                            if item.get("step_idx") == 0:
+                                input_ids = item.get("input_row_token_ids", [])
+                                break
+                        argmax_ids = sample_entry.get("argmax_row_token_ids", [])
+                        pending_ids = sample_entry.get("pending_token_ids", [])
+                        committed_ids = sample_entry.get("committed_token_ids", [])
+                        logger.info(
+                            "[MTP_DEBUG_FIRST] "
+                            f"rid={req.rid} "
+                            f"phase={req.mtp_phase} "
+                            f"step={debug_step_idx} "
+                            f"input_ids={input_ids} "
+                            f"input_text={req._mtp_debug_decode_token_ids(input_ids)!r} "
+                            f"argmax_ids={argmax_ids} "
+                            f"argmax_text={req._mtp_debug_decode_token_ids(argmax_ids)!r} "
+                            f"pending_ids={pending_ids} "
+                            f"pending_text={req._mtp_debug_decode_token_ids(pending_ids)!r} "
+                            f"committed_ids={committed_ids} "
+                            f"committed_text={req._mtp_debug_decode_token_ids(committed_ids)!r}"
+                        )
+                        req.mtp_debug_logged_first_argmax = True
+
+                if req.mtp_prev_step_cache_loc is not None:
+                    self.token_to_kv_pool_allocator.free(req.mtp_prev_step_cache_loc)
+                    req.kv_allocated_len -= int(req.mtp_prev_step_cache_loc.numel())
+                    req.mtp_prev_step_cache_loc = None
+
+                req.kv_committed_len += req.mtp_commit_len
+                if isinstance(next_token_id, list):
+                    req.mtp_pending_tokens = [int(x) for x in next_token_id]
+                else:
+                    req.mtp_pending_tokens = [int(next_token_id)]
+                expected_pending_len = req.sampling_params.mtp_k
+                if len(req.mtp_pending_tokens) != expected_pending_len:
+                    raise ValueError(
+                        "Unexpected MTP pending token count after decode sampling. "
+                        f"rid={req.rid}, phase={req.mtp_phase}, expected={expected_pending_len}, "
+                        f"got={len(req.mtp_pending_tokens)}."
+                    )
+                req.mtp_effective_k = len(req.mtp_pending_tokens)
+
+                if req_q_len > req.mtp_commit_len:
+                    req.mtp_prev_step_cache_loc = curr_step_cache_loc[
+                        req.mtp_commit_len :
+                    ].clone()
+
+                if req.mtp_phase == "seed":
+                    req.mtp_phase = "steady"
+
+                req.mtp_debug_upsert_step(
+                    debug_step_idx,
+                    {
+                        "committed_appended_to_output_ids": req._mtp_debug_cap_token_ids(
+                            committed_ids if isinstance(committed_ids, list) else []
+                        ),
+                        "pending_saved_for_next_step": req._mtp_debug_cap_token_ids(
+                            req.mtp_pending_tokens
+                        ),
+                        "kv_committed_len_before": kv_committed_len_before,
+                        "kv_committed_len_after": int(req.kv_committed_len),
+                        "kv_allocated_len_before": kv_allocated_len_before,
+                        "kv_allocated_len_after": int(req.kv_allocated_len),
+                        "mtp_commit_len": int(req.mtp_commit_len),
+                        "seq_len_base_used_for_next_decode": int(req.kv_committed_len),
+                    },
+                )
+
             req.check_finished(new_accepted_len)
 
             if req.finished():
+                if is_mtp_req:
+                    req.mtp_pending_tokens = []
+                if is_mtp_req and req.mtp_prev_step_cache_loc is not None:
+                    self.token_to_kv_pool_allocator.free(req.mtp_prev_step_cache_loc)
+                    req.kv_allocated_len -= int(req.mtp_prev_step_cache_loc.numel())
+                    req.mtp_prev_step_cache_loc = None
+                if is_mtp_req:
+                    req.kv_committed_len = req.kv_allocated_len
+
                 self.maybe_collect_routed_experts(req)
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
@@ -490,7 +672,11 @@ class SchedulerOutputProcessorMixin:
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
-            if req.return_logprob and batch.spec_algorithm.is_none():
+            if (
+                req.return_logprob
+                and batch.spec_algorithm.is_none()
+                and new_accepted_len == 1
+            ):
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])
                 req.output_token_logprobs_idx.append(next_token_id)
@@ -518,8 +704,20 @@ class SchedulerOutputProcessorMixin:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     if batch.spec_algorithm.is_none():
-                        # Normal decode: single token
-                        req.grammar.accept_token(next_token_id)
+                        # Normal decode: single token or MTP token list.
+                        if is_mtp_req:
+                            committed_ids = (
+                                mtp_committed_token_ids[i]
+                                if mtp_committed_token_ids is not None
+                                else []
+                            )
+                            for token_id in committed_ids:
+                                req.grammar.accept_token(token_id)
+                        elif isinstance(next_token_id, list):
+                            for token_id in next_token_id:
+                                req.grammar.accept_token(token_id)
+                        else:
+                            req.grammar.accept_token(next_token_id)
                     elif batch.is_spec_v2:
                         # Speculative decode: next_token_id is a list of accepted tokens
                         for token_id in next_token_id:
@@ -1129,9 +1327,19 @@ class SchedulerOutputProcessorMixin:
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
+                        if k == "mtp_debug_trace":
+                            continue
                         if k not in customized_info:
                             customized_info[k] = []
                         customized_info[k].append(v[send_token_offset:])
+
+                if (
+                    getattr(req.sampling_params, "mtp_enabled", False)
+                    and getattr(req, "mtp_debug_trace_enabled", False)
+                ):
+                    if "mtp_debug_trace" not in customized_info:
+                        customized_info["mtp_debug_trace"] = []
+                    customized_info["mtp_debug_trace"].append(req.mtp_debug_trace)
 
             if (
                 req.finished()

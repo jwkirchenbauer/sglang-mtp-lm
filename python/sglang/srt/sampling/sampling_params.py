@@ -64,6 +64,14 @@ class SamplingParams:
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
         sampling_seed: Optional[int] = None,
+        mtp_enabled: bool = False,
+        mtp_k: int = 1,
+        mtp_strategy: Optional[str] = None,
+        mtp_conf_threshold: Optional[float] = None,
+        mtp_temperature: Optional[float] = None,
+        mtp_mask_id: Optional[int] = None,
+        mtp_min_mask_id: Optional[int] = None,
+        mtp_max_mask_id: Optional[int] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -93,6 +101,14 @@ class SamplingParams:
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
         self.sampling_seed = sampling_seed
+        self.mtp_enabled = mtp_enabled
+        self.mtp_k = mtp_k
+        self.mtp_strategy = mtp_strategy
+        self.mtp_conf_threshold = mtp_conf_threshold
+        self.mtp_temperature = mtp_temperature
+        self.mtp_mask_id = mtp_mask_id
+        self.mtp_min_mask_id = mtp_min_mask_id
+        self.mtp_max_mask_id = mtp_max_mask_id
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
@@ -151,6 +167,54 @@ class SamplingParams:
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
+
+        if self.mtp_k < 1:
+            raise ValueError(f"mtp_k must be >= 1, got {self.mtp_k}.")
+        if self.mtp_conf_threshold is not None and not (
+            0.0 <= self.mtp_conf_threshold <= 1.0
+        ):
+            raise ValueError(
+                f"mtp_conf_threshold must be in [0, 1], got {self.mtp_conf_threshold}."
+            )
+        if self.mtp_temperature is not None and self.mtp_temperature < 0.0:
+            raise ValueError(
+                f"mtp_temperature must be non-negative, got {self.mtp_temperature}."
+            )
+        if self.mtp_min_mask_id is not None and self.mtp_max_mask_id is not None:
+            if self.mtp_min_mask_id > self.mtp_max_mask_id:
+                raise ValueError(
+                    "mtp_min_mask_id must be <= mtp_max_mask_id, got "
+                    f"{self.mtp_min_mask_id} > {self.mtp_max_mask_id}."
+                )
+        if self.mtp_enabled and self.mtp_k > 1:
+            if self.mtp_mask_id is None and self.mtp_min_mask_id is None:
+                raise ValueError(
+                    "MTP decode requires either mtp_mask_id or mtp_min_mask_id when mtp_k > 1."
+                )
+        if self.mtp_enabled:
+            # First-pass MTP runtime support is greedy-only.
+            if self.n != 1:
+                raise ValueError("mtp_enabled currently requires n == 1.")
+            if self.top_k != 1:
+                raise ValueError("mtp_enabled currently requires greedy decoding (top_k == 1).")
+            if self.top_p != 1.0 or self.min_p != 0.0:
+                raise ValueError(
+                    "mtp_enabled currently does not support top-p/min-p sampling."
+                )
+            if (
+                self.frequency_penalty != 0.0
+                or self.presence_penalty != 0.0
+                or self.repetition_penalty != 1.0
+            ):
+                raise ValueError(
+                    "mtp_enabled currently does not support repetition/frequency/presence penalties."
+                )
+        if self.mtp_strategy is not None:
+            allowed_mtp_strategies = {"none", "conf_adapt", "conf_adapt_sample@1"}
+            if self.mtp_strategy not in allowed_mtp_strategies:
+                raise ValueError(
+                    f"mtp_strategy must be one of {sorted(allowed_mtp_strategies)}, got {self.mtp_strategy}."
+                )
 
         grammars = [
             self.json_schema,
