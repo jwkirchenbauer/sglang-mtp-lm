@@ -455,6 +455,15 @@ class SchedulerOutputProcessorMixin:
             mtp_committed_token_ids = logits_output.mtp_committed_token_ids
             if isinstance(mtp_committed_token_ids, torch.Tensor):
                 mtp_committed_token_ids = mtp_committed_token_ids.tolist()
+        mtp_effective_k_per_req = None
+        if (
+            batch.spec_algorithm.is_none()
+            and logits_output is not None
+            and getattr(logits_output, "mtp_effective_k_per_req", None) is not None
+        ):
+            mtp_effective_k_per_req = logits_output.mtp_effective_k_per_req
+            if isinstance(mtp_effective_k_per_req, torch.Tensor):
+                mtp_effective_k_per_req = mtp_effective_k_per_req.tolist()
         mtp_sample_debug = None
         if (
             logits_output is not None
@@ -472,6 +481,8 @@ class SchedulerOutputProcessorMixin:
                         if mtp_committed_token_ids is not None
                         else []
                     )
+                    if mtp_effective_k_per_req is not None:
+                        committed_ids = committed_ids[: int(mtp_effective_k_per_req[i])]
                     total_generated += len(committed_ids)
                 else:
                     total_generated += len(next_token_id) if isinstance(next_token_id, list) else 1
@@ -503,6 +514,12 @@ class SchedulerOutputProcessorMixin:
                 and getattr(req.sampling_params, "mtp_enabled", False)
             )
             debug_step_idx = req.decode_batch_idx - 1
+            processed_step_idx = (
+                int(batch.mtp_debug_step_idx_per_req[i])
+                if batch.mtp_debug_step_idx_per_req is not None
+                and i < len(batch.mtp_debug_step_idx_per_req)
+                else int(debug_step_idx)
+            )
             kv_committed_len_before = int(req.kv_committed_len)
             kv_allocated_len_before = int(req.kv_allocated_len)
             req_q_len = batch.decode_q_len_per_req if is_mtp_req else 1
@@ -514,11 +531,26 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 if is_mtp_req:
+                    decode_k_this_step = (
+                        int(batch.mtp_decode_k_per_req[i])
+                        if batch.mtp_decode_k_per_req is not None
+                        and i < len(batch.mtp_decode_k_per_req)
+                        else int(req.mtp_decode_k_for_step())
+                    )
+                    effective_k_this_step = (
+                        int(mtp_effective_k_per_req[i])
+                        if mtp_effective_k_per_req is not None
+                        else decode_k_this_step
+                    )
+                    if effective_k_this_step < 1:
+                        effective_k_this_step = 1
                     committed_ids = (
                         mtp_committed_token_ids[i]
                         if mtp_committed_token_ids is not None
                         else []
                     )
+                    if committed_ids:
+                        committed_ids = [int(x) for x in committed_ids[:effective_k_this_step]]
                     if req.sampling_params.mtp_k == 1 and len(committed_ids) == 0:
                         # Defensive fallback: k=1 must always commit one token.
                         if isinstance(next_token_id, list):
@@ -563,8 +595,14 @@ class SchedulerOutputProcessorMixin:
                             "argmax_row_token_ids": sample_entry.get(
                                 "argmax_row_token_ids", []
                             ),
+                            "strategy_kind": sample_entry.get("strategy_kind"),
+                            "conf_threshold": sample_entry.get("conf_threshold"),
+                            "effective_k": sample_entry.get("effective_k"),
                             "pending_token_ids": sample_entry.get(
                                 "pending_token_ids", []
+                            ),
+                            "pending_confidences": sample_entry.get(
+                                "pending_confidences", []
                             ),
                             "committed_token_ids": sample_entry.get(
                                 "committed_token_ids", []
@@ -606,13 +644,26 @@ class SchedulerOutputProcessorMixin:
                     self.token_to_kv_pool_allocator.free(req.mtp_prev_step_cache_loc)
                     req.kv_allocated_len -= int(req.mtp_prev_step_cache_loc.numel())
                     req.mtp_prev_step_cache_loc = None
+                if req.mtp_overlap_prev_step_cache_loc is not None:
+                    self.token_to_kv_pool_allocator.free(req.mtp_overlap_prev_step_cache_loc)
+                    req.kv_allocated_len -= int(req.mtp_overlap_prev_step_cache_loc.numel())
+                    req.mtp_overlap_prev_step_cache_loc = None
 
+                if mtp_effective_k_per_req is not None and req.mtp_phase != "seed":
+                    req.mtp_commit_len = int(mtp_effective_k_per_req[i])
+                    if req.mtp_commit_len < 1:
+                        req.mtp_commit_len = 1
                 req.kv_committed_len += req.mtp_commit_len
                 if isinstance(next_token_id, list):
-                    req.mtp_pending_tokens = [int(x) for x in next_token_id]
+                    next_token_ids_list = [int(x) for x in next_token_id]
                 else:
-                    req.mtp_pending_tokens = [int(next_token_id)]
-                expected_pending_len = req.sampling_params.mtp_k
+                    next_token_ids_list = [int(next_token_id)]
+                expected_pending_len = (
+                    int(mtp_effective_k_per_req[i])
+                    if mtp_effective_k_per_req is not None
+                    else decode_k_this_step
+                )
+                req.mtp_pending_tokens = next_token_ids_list[:expected_pending_len]
                 if len(req.mtp_pending_tokens) != expected_pending_len:
                     raise ValueError(
                         "Unexpected MTP pending token count after decode sampling. "
@@ -620,6 +671,7 @@ class SchedulerOutputProcessorMixin:
                         f"got={len(req.mtp_pending_tokens)}."
                     )
                 req.mtp_effective_k = len(req.mtp_pending_tokens)
+                req.clear_mtp_overlap_provisional(upto_step_idx=processed_step_idx)
 
                 if req_q_len > req.mtp_commit_len:
                     req.mtp_prev_step_cache_loc = curr_step_cache_loc[
@@ -632,6 +684,13 @@ class SchedulerOutputProcessorMixin:
                 req.mtp_debug_upsert_step(
                     debug_step_idx,
                     {
+                        "can_run_cuda_graph": bool(can_run_cuda_graph),
+                        "phase_before_step": batch.mtp_phase,
+                        "decode_q_len_per_req_runtime": int(req_q_len),
+                        "decode_k_for_step_runtime": int(decode_k_this_step),
+                        "effective_k_runtime": int(
+                            effective_k_this_step
+                        ),
                         "committed_appended_to_output_ids": req._mtp_debug_cap_token_ids(
                             committed_ids if isinstance(committed_ids, list) else []
                         ),
@@ -644,6 +703,7 @@ class SchedulerOutputProcessorMixin:
                         "kv_allocated_len_after": int(req.kv_allocated_len),
                         "mtp_commit_len": int(req.mtp_commit_len),
                         "seq_len_base_used_for_next_decode": int(req.kv_committed_len),
+                        "phase_after_step": req.mtp_phase,
                     },
                 )
 
@@ -652,6 +712,11 @@ class SchedulerOutputProcessorMixin:
             if req.finished():
                 if is_mtp_req:
                     req.mtp_pending_tokens = []
+                    req.clear_mtp_overlap_provisional()
+                    if req.mtp_overlap_prev_step_cache_loc is not None:
+                        self.token_to_kv_pool_allocator.free(req.mtp_overlap_prev_step_cache_loc)
+                        req.kv_allocated_len -= int(req.mtp_overlap_prev_step_cache_loc.numel())
+                        req.mtp_overlap_prev_step_cache_loc = None
                 if is_mtp_req and req.mtp_prev_step_cache_loc is not None:
                     self.token_to_kv_pool_allocator.free(req.mtp_prev_step_cache_loc)
                     req.kv_allocated_len -= int(req.mtp_prev_step_cache_loc.numel())
@@ -669,6 +734,20 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.completion_time = time.perf_counter()
+                if is_mtp_req:
+                    finish_reason_json = (
+                        req.finished_reason.to_json()
+                        if req.finished_reason is not None
+                        else None
+                    )
+                    req.mtp_debug_upsert_step(
+                        processed_step_idx,
+                        {
+                            "finished": True,
+                            "finished_reason": finish_reason_json,
+                            "phase_after_step": req.mtp_phase,
+                        },
+                    )
 
             self.maybe_collect_customized_info(i, req, logits_output)
 

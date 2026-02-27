@@ -14,7 +14,8 @@
 """Sampling parameters for text generation."""
 
 import logging
-from typing import Any, Dict, List, Optional, Union
+import math
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
 try:
@@ -66,7 +67,7 @@ class SamplingParams:
         sampling_seed: Optional[int] = None,
         mtp_enabled: bool = False,
         mtp_k: int = 1,
-        mtp_strategy: Optional[str] = None,
+        mtp_strategy: Optional[Union[str, Sequence[Any]]] = None,
         mtp_conf_threshold: Optional[float] = None,
         mtp_temperature: Optional[float] = None,
         mtp_mask_id: Optional[int] = None,
@@ -109,6 +110,7 @@ class SamplingParams:
         self.mtp_mask_id = mtp_mask_id
         self.mtp_min_mask_id = mtp_min_mask_id
         self.mtp_max_mask_id = mtp_max_mask_id
+        self.mtp_strategy_kind: Optional[str] = None
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
@@ -118,7 +120,89 @@ class SamplingParams:
         if self.top_k == -1:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
+    def _parse_mtp_strategy(self):
+        self.mtp_strategy_kind = None
+        if self.mtp_strategy is None:
+            return
+
+        # Canonical strategy input is a list of basic literals, e.g.
+        # ["conf_adapt", 0.9]. Keep a minimal string fallback for legacy callers.
+        strategy_name: Optional[str] = None
+        threshold_val: Optional[float] = None
+
+        if isinstance(self.mtp_strategy, str):
+            strategy = self.mtp_strategy.strip().lower()
+            if strategy in {"", "none"}:
+                self.mtp_strategy = None
+                return
+            strategy_name = strategy
+        elif isinstance(self.mtp_strategy, Sequence):
+            strategy_items = list(self.mtp_strategy)
+            if len(strategy_items) == 0:
+                self.mtp_strategy = None
+                return
+            name_raw = strategy_items[0]
+            if not isinstance(name_raw, str):
+                raise ValueError(
+                    "mtp_strategy list must start with a strategy name string, "
+                    f"got {type(name_raw).__name__}."
+                )
+            strategy_name = name_raw.strip().lower()
+            if strategy_name in {"", "none"}:
+                self.mtp_strategy = None
+                return
+            if len(strategy_items) > 2:
+                raise ValueError(
+                    "mtp_strategy list supports at most two items: "
+                    "['conf_adapt', <threshold>]."
+                )
+            if len(strategy_items) == 2:
+                threshold_raw = strategy_items[1]
+                try:
+                    threshold_val = float(threshold_raw)
+                except (TypeError, ValueError) as e:
+                    raise ValueError(
+                        "Invalid conf_adapt threshold in mtp_strategy list: "
+                        f"{self.mtp_strategy!r}."
+                    ) from e
+        else:
+            raise ValueError(
+                "mtp_strategy must be a list like ['conf_adapt', <threshold>] "
+                f"or a legacy strategy string, got {type(self.mtp_strategy).__name__}."
+            )
+
+        if strategy_name == "conf_adapt":
+            if threshold_val is None:
+                if self.mtp_conf_threshold is None:
+                    raise ValueError(
+                        "mtp_strategy=['conf_adapt', <threshold>] requires a numeric threshold "
+                        "(or set mtp_conf_threshold)."
+                    )
+                threshold_val = float(self.mtp_conf_threshold)
+
+            if self.mtp_conf_threshold is not None and not math.isclose(
+                float(self.mtp_conf_threshold),
+                threshold_val,
+                rel_tol=0.0,
+                abs_tol=1e-8,
+            ):
+                raise ValueError(
+                    "Conflicting MTP threshold values from mtp_strategy and mtp_conf_threshold."
+                )
+
+            self.mtp_strategy_kind = "conf_adapt"
+            self.mtp_conf_threshold = threshold_val
+            self.mtp_strategy = ["conf_adapt", threshold_val]
+            return
+
+        raise ValueError(
+            "Unsupported mtp_strategy. Expected ['conf_adapt', <threshold>] "
+            f"(or legacy 'conf_adapt'), got {self.mtp_strategy!r}."
+        )
+
     def verify(self, vocab_size):
+        self._parse_mtp_strategy()
+
         if self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be non-negative, got {self.temperature}."
@@ -209,12 +293,8 @@ class SamplingParams:
                 raise ValueError(
                     "mtp_enabled currently does not support repetition/frequency/presence penalties."
                 )
-        if self.mtp_strategy is not None:
-            allowed_mtp_strategies = {"none", "conf_adapt", "conf_adapt_sample@1"}
-            if self.mtp_strategy not in allowed_mtp_strategies:
-                raise ValueError(
-                    f"mtp_strategy must be one of {sorted(allowed_mtp_strategies)}, got {self.mtp_strategy}."
-                )
+        if self.mtp_strategy_kind is not None and not self.mtp_enabled:
+            raise ValueError("mtp_strategy requires mtp_enabled=true.")
 
         grammars = [
             self.json_schema,

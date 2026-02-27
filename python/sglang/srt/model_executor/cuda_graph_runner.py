@@ -229,10 +229,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.req_pool_indices[raw_bs:bs].zero_()
+            self.input_ids[raw_num_token : bs * num_tokens_per_bs].zero_()
+            self.positions[raw_num_token : bs * num_tokens_per_bs].zero_()
+            self.mrope_positions[:, raw_num_token : bs * num_tokens_per_bs].zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
+            if self.encoder_lens is not None:
+                self.encoder_lens.zero_()
 
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
@@ -434,7 +440,12 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        decode_num_tokens_per_bs: Optional[int] = None,
+        lazy_capture: bool = False,
+    ):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
@@ -459,6 +470,7 @@ class CudaGraphRunner:
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
+        self.lazy_capture = lazy_capture
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -472,7 +484,10 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-        if (
+        if decode_num_tokens_per_bs is not None:
+            self.capture_forward_mode = ForwardMode.DECODE
+            self.num_tokens_per_bs = int(decode_num_tokens_per_bs)
+        elif (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
@@ -562,13 +577,14 @@ class CudaGraphRunner:
             self.model_runner.model.set_eagle3_layers_to_capture()
 
         # Capture
-        try:
-            with model_capture_mode():
-                self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
-            )
+        if not self.lazy_capture:
+            try:
+                with model_capture_mode():
+                    self.capture()
+            except RuntimeError as e:
+                raise Exception(
+                    f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                )
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -580,6 +596,12 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if (
+            forward_batch.batch_size * self.num_tokens_per_bs
+            != forward_batch.input_ids.numel()
+        ):
+            return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -594,11 +616,12 @@ class CudaGraphRunner:
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
-        is_bs_supported = (
-            graph_key in self.graphs
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
-        )
+        if self.disable_padding:
+            is_bs_supported = graph_key in self.graphs
+            if self.lazy_capture and not is_bs_supported:
+                is_bs_supported = cuda_graph_bs in self.capture_bs
+        else:
+            is_bs_supported = cuda_graph_bs <= self.max_bs
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -875,6 +898,11 @@ class CudaGraphRunner:
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
+            decode_q_len_per_req=(
+                self.num_tokens_per_bs
+                if self.capture_forward_mode.is_decode_or_idle()
+                else 1
+            ),
             lora_ids=lora_ids,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
@@ -883,6 +911,18 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
+        capture_kwargs = {}
+        if (
+            "decode_q_len_per_req"
+            in inspect.signature(
+                attn_backend.init_forward_metadata_capture_cuda_graph
+            ).parameters
+        ):
+            capture_kwargs["decode_q_len_per_req"] = (
+                self.num_tokens_per_bs
+                if forward_batch.forward_mode.is_decode_or_idle()
+                else 1
+            )
         attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
@@ -891,6 +931,7 @@ class CudaGraphRunner:
             encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            **capture_kwargs,
         )
 
         # Run and capture
@@ -923,7 +964,11 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        for _ in range(2):
+        # Lazy per-shape capture is invoked on live decode batches. Avoid extra
+        # warmup forwards there because multi-token decode-as-prefill can be
+        # stateful across repeated forwards to the same out_cache slots.
+        warmup_iters = 0 if self.lazy_capture else 2
+        for _ in range(warmup_iters):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
@@ -968,7 +1013,57 @@ class CudaGraphRunner:
         # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
         if self.capture_hidden_mode != required_capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
-            self.capture()
+            if self.lazy_capture:
+                # Lazy mode captures the needed graph key on-demand.
+                self.graphs.clear()
+                self.output_buffers.clear()
+            else:
+                self.capture()
+
+    def _graph_key(self, bs: int, stream_idx: Optional[int] = None):
+        if self.enable_pdmux:
+            if stream_idx is None:
+                stream_idx = get_current_stream_idx()
+            return f"{stream_idx}_{bs}"
+        return bs
+
+    def _ensure_graph_captured(
+        self, bs: int, stream_idx: Optional[int] = None
+    ) -> bool:
+        graph_key = self._graph_key(bs, stream_idx)
+        if graph_key in self.graphs:
+            return False
+
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+            if not self.enable_pdmux:
+                with graph_capture() as graph_capture_context:
+                    self.stream = graph_capture_context.stream
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        graph, output_buffers = self.capture_one_batch_size(bs, forward)
+                        self.graphs[graph_key] = graph
+                        self.output_buffers[graph_key] = output_buffers
+            else:
+                assert stream_idx is not None
+                stream_group = self.stream_groups[stream_idx]
+                with graph_capture(stream=stream_group[1]) as graph_capture_context:
+                    self.stream = graph_capture_context.stream
+                    with patch_model(
+                        self.model_runner.model,
+                        bs in self.compile_bs,
+                        num_tokens=bs * self.num_tokens_per_bs,
+                        tp_group=self.model_runner.tp_group,
+                    ) as forward:
+                        graph, output_buffers = self.capture_one_batch_size(
+                            bs, forward, stream_idx
+                        )
+                        self.graphs[graph_key] = graph
+                        self.output_buffers[graph_key] = output_buffers
+        return True
 
     def replay_prepare(
         self,
@@ -994,6 +1089,7 @@ class CudaGraphRunner:
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
+        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
 
         buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
@@ -1009,6 +1105,10 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if self.lazy_capture:
+            # Capture using real runtime batch tensors (including seq_lens/positions)
+            # instead of synthetic defaults from buffer initialization.
+            self._ensure_graph_captured(bs, stream_idx)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
@@ -1020,10 +1120,21 @@ class CudaGraphRunner:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
         if self.enable_pdmux:
-            stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
+        replay_kwargs = {"seq_lens_cpu": buffers.seq_lens_cpu[:bs]}
+        if (
+            "decode_q_len_per_req"
+            in inspect.signature(
+                attn_backend.init_forward_metadata_replay_cuda_graph
+            ).parameters
+        ):
+            replay_kwargs["decode_q_len_per_req"] = (
+                self.num_tokens_per_bs
+                if self.capture_forward_mode.is_decode_or_idle()
+                else 1
+            )
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1032,7 +1143,7 @@ class CudaGraphRunner:
             buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
             self.capture_forward_mode,
             forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            **replay_kwargs,
         )
 
         # Store fields
@@ -1056,10 +1167,7 @@ class CudaGraphRunner:
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
-        else:
-            graph_key = self.bs
+        graph_key = self._graph_key(self.bs)
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 

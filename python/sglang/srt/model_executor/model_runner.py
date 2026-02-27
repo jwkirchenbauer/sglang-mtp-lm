@@ -246,6 +246,7 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+_LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_WARNING = False
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -601,6 +602,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
+        self.mtp_decode_graph_runners = {}
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
@@ -2119,6 +2121,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def init_device_graphs(self):
         """Capture device graphs."""
         self.graph_runner = None
+        self.mtp_decode_graph_runners = {}
         self.graph_mem_usage = 0
 
         if not self.is_generation:
@@ -2236,6 +2239,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+    def _get_graph_runner_for_forward_batch(self, forward_batch: ForwardBatch):
+        graph_runner = self.graph_runner
+        if (
+            graph_runner is not None
+            and isinstance(graph_runner, CudaGraphRunner)
+            and self.device != "cpu"
+            and forward_batch.forward_mode.is_decode()
+            and int(forward_batch.decode_q_len_per_req) > 1
+        ):
+            decode_q_len = int(forward_batch.decode_q_len_per_req)
+            cached_runner = self.mtp_decode_graph_runners.get(decode_q_len)
+            if cached_runner is None:
+                cached_runner = CudaGraphRunner(
+                    self,
+                    decode_num_tokens_per_bs=decode_q_len,
+                    lazy_capture=True,
+                )
+                self.mtp_decode_graph_runners[decode_q_len] = cached_runner
+            graph_runner = cached_runner
+        return graph_runner
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
@@ -2453,15 +2477,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device == "cpu"
             else forward_batch.forward_mode.is_cuda_graph
         )
-        can_run_graph = bool(
-            mode_check()
-            and self.graph_runner
-            and self.graph_runner.can_run(forward_batch)
-            and forward_batch.decode_q_len_per_req == 1
+        global _LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_WARNING
+        q_len_gt1_decode = bool(
+            forward_batch.forward_mode.is_decode()
+            and int(forward_batch.decode_q_len_per_req) > 1
         )
+        if q_len_gt1_decode:
+            graph_runner = None
+            can_run_graph = False
+            if not _LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_WARNING:
+                _LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_WARNING = True
+                logger.warning(
+                    "Temporary phase-2A policy: bypassing cuda graph replay for decode_q_len_per_req>1 "
+                    "pending q>1 stabilization. payload=%s",
+                    {
+                        "decode_q_len_per_req": int(
+                            forward_batch.decode_q_len_per_req
+                        ),
+                        "mtp_phase": getattr(forward_batch, "mtp_phase", None),
+                        "mtp_strategy_kind": getattr(
+                            forward_batch, "mtp_strategy_kind", None
+                        ),
+                    },
+                )
+        else:
+            graph_runner = self._get_graph_runner_for_forward_batch(forward_batch)
+            can_run_graph = bool(
+                mode_check()
+                and graph_runner
+                and graph_runner.can_run(forward_batch)
+            )
 
         if can_run_graph:
-            ret = self.graph_runner.replay(
+            ret = graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -2554,6 +2602,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             def _cap_row(t: torch.Tensor) -> List[int]:
                 return [int(x) for x in t[:16].tolist()]
 
+            def _cap_row_float(t: torch.Tensor) -> List[float]:
+                return [float(x) for x in t[:16].tolist()]
+
             positions_rows = None
             if (
                 forward_batch.forward_mode.is_decode()
@@ -2598,6 +2649,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 logits_output.mtp_committed_token_ids = token_ids
                 logits_output.mtp_pending_token_ids = token_ids
+                if getattr(forward_batch, "mtp_strategy_kind", None) == "conf_adapt":
+                    logits_output.mtp_effective_k_per_req = torch.ones(
+                        (bs,), dtype=torch.int32, device=token_ids.device
+                    )
 
                 if (
                     forward_batch.mtp_debug_trace_enabled_per_req is not None
@@ -2612,6 +2667,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             continue
                         sample_debug[i] = {
                             "step_idx": int(step_idxs[i]),
+                            "phase": forward_batch.mtp_phase,
+                            "decode_q_len_per_req": 1,
+                            "effective_k": 1,
                             "argmax_row_token_ids": _cap_row(token_ids[i]),
                             "pending_token_ids": _cap_row(token_ids[i]),
                             "committed_token_ids": _cap_row(token_ids[i]),
@@ -2651,96 +2709,100 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             f"with batch_size={bs}, q_len={q_len}."
                         )
                     token_ids = torch.argmax(logits, dim=-1).view(bs, q_len)
-                    pending_ids = token_ids[:, emit_start:emit_end].to(torch.int32)
-                    if forward_batch.mtp_phase == "steady":
-                        logits_output.mtp_committed_token_ids = token_ids[
-                            :, : emit_start + 1
-                        ].to(torch.int32)
-                    else:
-                        logits_output.mtp_committed_token_ids = torch.empty(
-                            (bs, 0), dtype=torch.int32, device=token_ids.device
-                        )
-                    logits_output.mtp_pending_token_ids = pending_ids
-                    if (
-                        forward_batch.mtp_debug_trace_enabled_per_req is not None
-                        and any(forward_batch.mtp_debug_trace_enabled_per_req)
-                    ):
-                        if logits_output.customized_info is None:
-                            logits_output.customized_info = {}
-                        step_idxs = forward_batch.mtp_debug_step_idx_per_req or [
-                            -1
-                        ] * bs
-                        sample_debug = [None] * bs
-                        for i in range(bs):
-                            if not forward_batch.mtp_debug_trace_enabled_per_req[i]:
-                                continue
-                            sample_debug[i] = {
-                                "step_idx": int(step_idxs[i]),
-                                "argmax_row_token_ids": _cap_row(token_ids[i]),
-                                "pending_token_ids": _cap_row(pending_ids[i]),
-                                "committed_token_ids": _cap_row(
-                                    logits_output.mtp_committed_token_ids[i]
-                                ),
-                                "positions_row": (
-                                    _cap_row(positions_rows[i])
-                                    if positions_rows is not None
-                                    else []
-                                ),
-                                "logits_shape": [int(x) for x in logits.shape],
-                            }
-                        logits_output.customized_info["mtp_debug_sample"] = sample_debug
-                    return pending_ids
-
-                if logits.ndim == 3:
+                    top1_conf = torch.softmax(logits, dim=-1).amax(dim=-1).view(bs, q_len)
+                elif logits.ndim == 3:
                     if logits.shape[0] != bs or logits.shape[1] != q_len:
                         raise ValueError(
                             "MTP decode logits shape mismatch for rank-3 logits. "
                             f"Expected [{bs}, {q_len}, vocab], got {tuple(logits.shape)}."
                         )
                     token_ids = torch.argmax(logits, dim=-1)
-                    pending_ids = token_ids[:, emit_start:emit_end].to(torch.int32)
-                    if forward_batch.mtp_phase == "steady":
-                        logits_output.mtp_committed_token_ids = token_ids[
-                            :, : emit_start + 1
-                        ].to(torch.int32)
-                    else:
-                        logits_output.mtp_committed_token_ids = torch.empty(
-                            (bs, 0), dtype=torch.int32, device=token_ids.device
-                        )
-                    logits_output.mtp_pending_token_ids = pending_ids
-                    if (
-                        forward_batch.mtp_debug_trace_enabled_per_req is not None
-                        and any(forward_batch.mtp_debug_trace_enabled_per_req)
-                    ):
-                        if logits_output.customized_info is None:
-                            logits_output.customized_info = {}
-                        step_idxs = forward_batch.mtp_debug_step_idx_per_req or [
-                            -1
-                        ] * bs
-                        sample_debug = [None] * bs
-                        for i in range(bs):
-                            if not forward_batch.mtp_debug_trace_enabled_per_req[i]:
-                                continue
-                            sample_debug[i] = {
-                                "step_idx": int(step_idxs[i]),
-                                "argmax_row_token_ids": _cap_row(token_ids[i]),
-                                "pending_token_ids": _cap_row(pending_ids[i]),
-                                "committed_token_ids": _cap_row(
-                                    logits_output.mtp_committed_token_ids[i]
-                                ),
-                                "positions_row": (
-                                    _cap_row(positions_rows[i])
-                                    if positions_rows is not None
-                                    else []
-                                ),
-                                "logits_shape": [int(x) for x in logits.shape],
-                            }
-                        logits_output.customized_info["mtp_debug_sample"] = sample_debug
-                    return pending_ids
+                    top1_conf = torch.softmax(logits, dim=-1).amax(dim=-1)
+                else:
+                    raise ValueError(
+                        f"Unsupported logits rank {logits.ndim} for MTP decode."
+                    )
 
-                raise ValueError(
-                    f"Unsupported logits rank {logits.ndim} for MTP decode."
+                pending_ids = token_ids[:, emit_start:emit_end].to(torch.int32)
+                effective_k = torch.full(
+                    (bs,),
+                    emit_len,
+                    dtype=torch.int32,
+                    device=pending_ids.device,
                 )
+                strategy_kind = getattr(forward_batch, "mtp_strategy_kind", None)
+                if strategy_kind == "conf_adapt":
+                    threshold = forward_batch.mtp_conf_threshold
+                    if threshold is None:
+                        raise ValueError(
+                            "MTP conf_adapt strategy requires mtp_conf_threshold."
+                        )
+                    pending_conf = top1_conf[:, emit_start:emit_end]
+                    for i in range(bs):
+                        lt_thresh_mask = pending_conf[i] < threshold
+                        if torch.all(~lt_thresh_mask):
+                            chosen_len = emit_len
+                        else:
+                            chosen_len = int(torch.argmax(lt_thresh_mask.int()).item())
+                            if chosen_len < 1:
+                                chosen_len = 1
+                        effective_k[i] = chosen_len
+
+                if forward_batch.mtp_phase == "steady":
+                    logits_output.mtp_committed_token_ids = token_ids[
+                        :, : emit_start + 1
+                    ].to(torch.int32)
+                else:
+                    logits_output.mtp_committed_token_ids = torch.empty(
+                        (bs, 0), dtype=torch.int32, device=token_ids.device
+                    )
+                logits_output.mtp_pending_token_ids = pending_ids
+                if strategy_kind == "conf_adapt":
+                    logits_output.mtp_effective_k_per_req = effective_k
+
+                if (
+                    forward_batch.mtp_debug_trace_enabled_per_req is not None
+                    and any(forward_batch.mtp_debug_trace_enabled_per_req)
+                ):
+                    if logits_output.customized_info is None:
+                        logits_output.customized_info = {}
+                    step_idxs = forward_batch.mtp_debug_step_idx_per_req or [-1] * bs
+                    sample_debug = [None] * bs
+                    for i in range(bs):
+                        if not forward_batch.mtp_debug_trace_enabled_per_req[i]:
+                            continue
+                        ek = int(effective_k[i].item())
+                        sample_debug[i] = {
+                            "step_idx": int(step_idxs[i]),
+                            "phase": forward_batch.mtp_phase,
+                            "decode_q_len_per_req": int(q_len),
+                            "emit_window_start": int(emit_start),
+                            "emit_window_len": int(emit_len),
+                            "strategy_kind": strategy_kind,
+                            "conf_threshold": (
+                                float(forward_batch.mtp_conf_threshold)
+                                if forward_batch.mtp_conf_threshold is not None
+                                else None
+                            ),
+                            "effective_k": ek,
+                            "argmax_row_token_ids": _cap_row(token_ids[i]),
+                            "pending_token_ids": _cap_row(pending_ids[i][:ek]),
+                            "pending_confidences": _cap_row_float(
+                                top1_conf[i, emit_start:emit_end][:ek]
+                            ),
+                            "committed_token_ids": _cap_row(
+                                logits_output.mtp_committed_token_ids[i][:ek]
+                            ),
+                            "positions_row": (
+                                _cap_row(positions_rows[i])
+                                if positions_rows is not None
+                                else []
+                            ),
+                            "logits_shape": [int(x) for x in logits.shape],
+                        }
+                    logits_output.customized_info["mtp_debug_sample"] = sample_debug
+                return pending_ids
+
 
             if logits.ndim == 3:
                 return torch.argmax(logits, dim=-1).to(torch.int32)

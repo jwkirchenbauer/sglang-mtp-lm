@@ -74,8 +74,11 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.request_metrics_exporter import RequestMetricsExporterManager
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, RequestStage
-from sglang.srt.managers.schedule_batch import MTP_OVERLAP_ERROR_MSG
+from sglang.srt.managers.schedule_batch import (
+    MTP_OVERLAP_ERROR_MSG,
+    MultimodalDataItem,
+    RequestStage,
+)
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -917,7 +920,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and not self.server_args.disable_overlap_schedule
         ):
             raise ValueError(MTP_OVERLAP_ERROR_MSG)
-
         # Build return object
         if isinstance(obj, GenerateReqInput):
             session_params = (

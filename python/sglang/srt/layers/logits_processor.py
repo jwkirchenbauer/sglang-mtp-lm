@@ -108,6 +108,7 @@ class LogitsProcessorOutput:
     # MTP decode internals: committed tokens (for output) and pending tokens (for next step).
     mtp_committed_token_ids: Optional[torch.Tensor] = None
     mtp_pending_token_ids: Optional[torch.Tensor] = None
+    mtp_effective_k_per_req: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass

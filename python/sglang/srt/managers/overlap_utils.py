@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence, Union
 
 import torch
 
@@ -18,10 +18,13 @@ _is_npu = is_npu()
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def _resolve_future_token_ids(input_ids, future_token_ids_map):
+def _resolve_future_token_ids(input_ids, future_token_ids_map, future_ref_stride):
+    future_refs = torch.clamp(-input_ids, min=0)
+    row_indices = torch.div(future_refs, future_ref_stride, rounding_mode="trunc")
+    col_indices = torch.remainder(future_refs, future_ref_stride)
     input_ids[:] = torch.where(
         input_ids < 0,
-        future_token_ids_map[torch.clamp(-input_ids, min=0)],
+        future_token_ids_map[row_indices, col_indices],
         input_ids,
     )
 
@@ -33,6 +36,11 @@ class FutureIndices:
 
 
 class FutureMap:
+    # Use a fixed stride for future token reference encoding.
+    # Encoded reference: -(future_index * stride + token_offset)
+    # token_offset is 0 for normal decode, and [0, effective_k) for MTP windows.
+    FUTURE_TOKEN_REF_STRIDE = 128
+
     def __init__(
         self,
         max_running_requests: int,
@@ -60,10 +68,20 @@ class FutureMap:
         self.spec_algo = spec_algo
 
         if self.spec_algo.is_none():
-            # For non-speculative decoding, we only need to store the token ids.
+            # For non-speculative decoding, keep a token window per future entry.
+            # The first column is used by normal decode; additional columns are used
+            # by adaptive/static MTP overlap relay.
             self.buf_initialized = True
             self.token_ids_buf = torch.empty(
-                (self.future_buffer_len,), dtype=torch.int64, device=self.device
+                (self.future_buffer_len, self.FUTURE_TOKEN_REF_STRIDE),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.mtp_effective_k_buf = torch.ones(
+                (self.future_buffer_len,), dtype=torch.int32, device=self.device
+            )
+            self.mtp_window_len_buf = torch.ones(
+                (self.future_buffer_len,), dtype=torch.int32, device=self.device
             )
         else:
             # For speculative decoding, we lazily initialize the buffers
@@ -119,7 +137,11 @@ class FutureMap:
 
     def resolve_future(self, model_worker_batch: ModelWorkerBatch):
         if self.spec_algo.is_none():
-            _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
+            _resolve_future_token_ids(
+                model_worker_batch.input_ids,
+                self.token_ids_buf,
+                self.FUTURE_TOKEN_REF_STRIDE,
+            )
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
@@ -153,10 +175,113 @@ class FutureMap:
     ):
         if self.spec_algo.is_none():
             intv = future_indices.interval
-            self.token_ids_buf[intv] = batch_result.next_token_ids
+            next_token_ids = batch_result.next_token_ids
+            if isinstance(next_token_ids, list):
+                if len(next_token_ids) == 0:
+                    raise ValueError("Empty next_token_ids in overlap future map store.")
+                if isinstance(next_token_ids[0], torch.Tensor):
+                    next_token_ids = torch.stack(next_token_ids)
+                else:
+                    next_token_ids = torch.tensor(
+                        next_token_ids, dtype=torch.int64, device=self.device
+                    )
+            if next_token_ids.ndim == 1:
+                token_windows = next_token_ids.unsqueeze(1)
+            elif next_token_ids.ndim == 2:
+                token_windows = next_token_ids
+            else:
+                raise ValueError(
+                    "Unsupported next_token_ids rank for overlap future map: "
+                    f"{next_token_ids.ndim}."
+                )
+
+            window_len = int(token_windows.shape[1])
+            if window_len > self.FUTURE_TOKEN_REF_STRIDE:
+                raise ValueError(
+                    "MTP future token window exceeds overlap reference stride. "
+                    f"window_len={window_len}, stride={self.FUTURE_TOKEN_REF_STRIDE}."
+                )
+
+            token_windows = token_windows.to(
+                device=self.device, dtype=torch.int64, non_blocking=True
+            )
+            self.token_ids_buf[intv].zero_()
+            self.token_ids_buf[intv, :window_len] = token_windows
+            self.mtp_window_len_buf[intv] = window_len
+
+            effective_k = None
+            if batch_result.logits_output is not None:
+                effective_k = getattr(
+                    batch_result.logits_output, "mtp_effective_k_per_req", None
+                )
+            if effective_k is None:
+                self.mtp_effective_k_buf[intv] = 1
+            else:
+                if not isinstance(effective_k, torch.Tensor):
+                    effective_k = torch.tensor(
+                        effective_k, dtype=torch.int32, device=self.device
+                    )
+                else:
+                    effective_k = effective_k.to(
+                        device=self.device, dtype=torch.int32, non_blocking=True
+                    )
+                self.mtp_effective_k_buf[intv] = torch.clamp(
+                    effective_k, min=1, max=window_len
+                )
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
             self.store_to_map_for_new_batch(future_indices, draft_input)
+
+    def _make_future_token_refs(
+        self,
+        indices: torch.Tensor,
+        token_offset: Union[int, torch.Tensor] = 0,
+    ) -> torch.Tensor:
+        if isinstance(token_offset, int):
+            offsets = torch.full_like(indices, token_offset)
+        else:
+            offsets = token_offset.to(device=indices.device, dtype=indices.dtype)
+        if torch.any(offsets >= self.FUTURE_TOKEN_REF_STRIDE) or torch.any(offsets < 0):
+            raise ValueError(
+                "Invalid future token offset for overlap reference encoding: "
+                f"offsets must be in [0, {self.FUTURE_TOKEN_REF_STRIDE - 1}]."
+            )
+        return -(
+            indices.to(dtype=torch.int64) * self.FUTURE_TOKEN_REF_STRIDE
+            + offsets.to(dtype=torch.int64)
+        )
+
+    def make_single_token_future_refs(self, indices: torch.Tensor) -> torch.Tensor:
+        return self._make_future_token_refs(indices, token_offset=0)
+
+    def build_mtp_pending_token_refs(
+        self,
+        future_indices: FutureIndices,
+        effective_k_per_req: Sequence[int],
+    ) -> List[List[int]]:
+        indices = future_indices.indices.detach().to("cpu").tolist()
+        if len(indices) != len(effective_k_per_req):
+            raise ValueError(
+                "Mismatch between future indices and effective-k metadata for MTP overlap relay: "
+                f"indices={len(indices)}, effective_k={len(effective_k_per_req)}."
+            )
+
+        pending_refs: List[List[int]] = []
+        for future_idx, effective_k in zip(indices, effective_k_per_req):
+            ek = int(effective_k)
+            if ek < 1:
+                ek = 1
+            if ek > self.FUTURE_TOKEN_REF_STRIDE:
+                raise ValueError(
+                    "MTP effective-k exceeds overlap reference stride. "
+                    f"effective_k={ek}, stride={self.FUTURE_TOKEN_REF_STRIDE}."
+                )
+            refs = [
+                int(-(future_idx * self.FUTURE_TOKEN_REF_STRIDE + token_offset))
+                for token_offset in range(ek)
+            ]
+            pending_refs.append(refs)
+        return pending_refs
 
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput

@@ -135,7 +135,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
-from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -2054,6 +2054,8 @@ class Scheduler(
             for req in self.running_batch.reqs
             if getattr(req.sampling_params, "mtp_enabled", False)
         ]
+        if self.enable_overlap and running_mtp_reqs:
+            raise ValueError(MTP_OVERLAP_ERROR_MSG)
         running_non_mtp_reqs = [
             req
             for req in self.running_batch.reqs
@@ -2063,27 +2065,27 @@ class Scheduler(
             raise ValueError(
                 "Running decode batch contains mixed MTP-enabled and non-MTP requests."
             )
-        running_mtp_phase = None
-        running_mtp_k = None
+        running_mtp_bucket = None
         if running_mtp_reqs:
-            running_mtp_phase_set = {req.mtp_phase for req in running_mtp_reqs}
-            running_mtp_k_set = {req.sampling_params.mtp_k for req in running_mtp_reqs}
-            if len(running_mtp_phase_set) != 1 or len(running_mtp_k_set) != 1:
+            running_mtp_bucket_set = {
+                req.mtp_decode_bucket_key() for req in running_mtp_reqs
+            }
+            if len(running_mtp_bucket_set) != 1:
                 raise ValueError(
-                    f"Running decode batch has mixed MTP settings: {running_mtp_phase_set=}, {running_mtp_k_set=}"
+                    "Running decode batch has mixed adaptive MTP settings: "
+                    f"{running_mtp_bucket_set=}"
                 )
-            running_mtp_phase = next(iter(running_mtp_phase_set))
-            running_mtp_k = next(iter(running_mtp_k_set))
+            running_mtp_bucket = next(iter(running_mtp_bucket_set))
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             req_is_mtp = getattr(req.sampling_params, "mtp_enabled", False)
+            if self.enable_overlap and req_is_mtp:
+                raise ValueError(MTP_OVERLAP_ERROR_MSG)
             if running_mtp_reqs:
                 if not req_is_mtp:
                     continue
-                if req.sampling_params.mtp_k != running_mtp_k:
-                    continue
-                if req.mtp_phase != running_mtp_phase:
+                if req.mtp_decode_bucket_key() != running_mtp_bucket:
                     continue
             elif running_non_mtp_reqs and req_is_mtp:
                 continue
@@ -2093,9 +2095,7 @@ class Scheduler(
                 if req_is_mtp != first_is_mtp:
                     continue
                 if req_is_mtp:
-                    if req.sampling_params.mtp_k != first_req.sampling_params.mtp_k:
-                        continue
-                    if req.mtp_phase != first_req.mtp_phase:
+                    if req.mtp_decode_bucket_key() != first_req.mtp_decode_bucket_key():
                         continue
 
             if self.enable_lora and req.lora_id not in running_loras:
@@ -2250,15 +2250,50 @@ class Scheduler(
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
+        batch.filter_batch(v1_spec_info_filtered=True)
+        if batch.is_empty():
+            batch.batch_is_full = False
+            return batch
         if self.enable_overlap and any(
             getattr(req.sampling_params, "mtp_enabled", False) for req in batch.reqs
         ):
             raise ValueError(MTP_OVERLAP_ERROR_MSG)
 
-        batch.filter_batch(v1_spec_info_filtered=True)
-        if batch.is_empty():
-            batch.batch_is_full = False
-            return batch
+        # Adaptive MTP can diverge into multiple decode-shape buckets after each
+        # step. Keep a homogeneous bucket in the running batch and defer other
+        # buckets to later scheduling rounds.
+        if batch.forward_mode.is_decode():
+            mtp_indices = [
+                idx
+                for idx, req in enumerate(batch.reqs)
+                if getattr(req.sampling_params, "mtp_enabled", False)
+            ]
+            if mtp_indices and len(mtp_indices) == len(batch.reqs):
+                bucket_to_indices = {}
+                for idx in mtp_indices:
+                    key = batch.reqs[idx].mtp_decode_bucket_key()
+                    bucket_to_indices.setdefault(key, []).append(idx)
+
+                if len(bucket_to_indices) > 1:
+                    _, keep_indices = max(
+                        bucket_to_indices.items(), key=lambda item: len(item[1])
+                    )
+                    keep_set = set(keep_indices)
+                    defer_indices = sorted(
+                        idx
+                        for indices in bucket_to_indices.values()
+                        for idx in indices
+                        if idx not in keep_set
+                    )
+                    deferred_reqs = [batch.reqs[idx] for idx in defer_indices]
+
+                    batch.filter_batch(keep_indices=sorted(keep_indices))
+                    for req in deferred_reqs:
+                        self._add_request_to_queue(req)
+
+                    batch.batch_is_full = False
+                    if batch.is_empty():
+                        return batch
 
         # Check if decode out of memory
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
@@ -2326,6 +2361,112 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _get_mtp_effective_k_per_req(
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+    ) -> Optional[List[int]]:
+        if (
+            batch_result is None
+            or batch_result.logits_output is None
+            or not batch.reqs
+            or not all(
+                getattr(req.sampling_params, "mtp_enabled", False) for req in batch.reqs
+            )
+        ):
+            return None
+
+        effective_k = getattr(
+            batch_result.logits_output, "mtp_effective_k_per_req", None
+        )
+        if effective_k is None:
+            if batch.mtp_decode_k_per_req is None:
+                return None
+            return [max(1, int(x)) for x in batch.mtp_decode_k_per_req]
+
+        if isinstance(effective_k, torch.Tensor):
+            effective_k_list = effective_k.detach().to("cpu").tolist()
+        else:
+            effective_k_list = list(effective_k)
+
+        if len(effective_k_list) != len(batch.reqs):
+            raise ValueError(
+                "MTP effective-k metadata size mismatch during overlap relay: "
+                f"effective_k={len(effective_k_list)}, batch_size={len(batch.reqs)}."
+            )
+
+        max_decode_k = (
+            [int(x) for x in batch.mtp_decode_k_per_req]
+            if batch.mtp_decode_k_per_req is not None
+            else [int(req.sampling_params.mtp_k) for req in batch.reqs]
+        )
+
+        return [
+            max(1, min(int(effective_k_list[i]), max_decode_k[i]))
+            for i in range(len(effective_k_list))
+        ]
+
+    def _stage_mtp_overlap_future_state(
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        future_indices: FutureIndices,
+    ) -> None:
+        if (
+            batch is None
+            or batch_result is None
+            or future_indices is None
+            or not batch.forward_mode.is_decode()
+            or not batch.spec_algorithm.is_none()
+            or not batch.reqs
+        ):
+            return
+        if self.enable_overlap and any(
+            getattr(req.sampling_params, "mtp_enabled", False) for req in batch.reqs
+        ):
+            raise ValueError(MTP_OVERLAP_ERROR_MSG)
+
+        if not all(getattr(req.sampling_params, "mtp_enabled", False) for req in batch.reqs):
+            return
+
+        effective_k_per_req = self._get_mtp_effective_k_per_req(batch, batch_result)
+        if effective_k_per_req is None:
+            return
+
+        pending_refs_per_req = self.future_map.build_mtp_pending_token_refs(
+            future_indices, effective_k_per_req
+        )
+        step_idxs = batch.mtp_debug_step_idx_per_req or [
+            int(req.decode_batch_idx - 1) for req in batch.reqs
+        ]
+        phase_for_batch = batch.mtp_phase
+
+        for i, req in enumerate(batch.reqs):
+            effective_k = int(effective_k_per_req[i])
+            if req.mtp_overlap_prev_step_cache_loc is not None:
+                self.token_to_kv_pool_allocator.free(req.mtp_overlap_prev_step_cache_loc)
+                req.kv_allocated_len -= int(req.mtp_overlap_prev_step_cache_loc.numel())
+                req.mtp_overlap_prev_step_cache_loc = None
+                if req.kv_allocated_len < req.kv_committed_len:
+                    raise ValueError(
+                        "Invalid KV lengths after freeing overlap MTP tail cache in scheduler: "
+                        f"{req.kv_committed_len=} > {req.kv_allocated_len=}"
+                    )
+            req.mtp_overlap_pending_token_refs = pending_refs_per_req[i]
+            req.mtp_overlap_effective_k = effective_k
+            req.mtp_overlap_next_phase = (
+                "steady" if phase_for_batch == "seed" else phase_for_batch
+            )
+            req.mtp_overlap_commit_len = 1 if phase_for_batch == "seed" else effective_k
+            req.mtp_overlap_pending_step_idx = int(step_idxs[i])
+            req_q_len = int(batch.decode_q_len_per_req)
+            start = i * req_q_len
+            curr_step_cache_loc = batch.out_cache_loc[start : start + req_q_len]
+            if req_q_len > req.mtp_overlap_commit_len:
+                req.mtp_overlap_prev_step_cache_loc = curr_step_cache_loc[
+                    req.mtp_overlap_commit_len :
+                ].clone()
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -2375,6 +2516,29 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
+                    if (
+                        batch.forward_mode.is_decode()
+                        and batch.spec_algorithm.is_none()
+                        and any(
+                            getattr(req.sampling_params, "mtp_enabled", False)
+                            for req in batch.reqs
+                        )
+                    ):
+                        # Overlap decode rows may contain negative future refs before
+                        # resolution; model inputs must not contain them afterwards.
+                        unresolved_future_mask = model_worker_batch.input_ids < 0
+                        if bool(torch.any(unresolved_future_mask).item()):
+                            unresolved_refs = (
+                                model_worker_batch.input_ids[unresolved_future_mask][:16]
+                                .detach()
+                                .to("cpu")
+                                .tolist()
+                            )
+                            raise ValueError(
+                                "Unresolved overlap future token references detected "
+                                "after resolve_future in MTP decode batch. "
+                                f"sample_refs={unresolved_refs}"
+                            )
                     with self.record_forward_metrics(batch):
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch
@@ -2384,12 +2548,17 @@ class Scheduler(
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
+                        self._stage_mtp_overlap_future_state(
+                            batch, batch_result, future_indices
+                        )
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
+                future_indices_or_next_token_ids = (
+                    self.future_map.make_single_token_future_refs(future_indices.indices)
+                )
 
                 if batch.is_spec_v2:
                     # FIXME(lsyin): tmp code for spec v2
@@ -2493,6 +2662,10 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            if self.cur_batch is not None:
+                self._stage_mtp_overlap_future_state(
+                    self.cur_batch, batch_result, batch_result.future_indices
+                )
             batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
     def process_batch_result(

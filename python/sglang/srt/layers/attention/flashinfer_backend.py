@@ -296,6 +296,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
 
         self.decode_cuda_graph_metadata = {}
+        self.decode_prefill_cuda_graph_metadata = {}
+        self.decode_cuda_graph_q_len_per_req = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
 
@@ -581,43 +583,127 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        decode_q_len_per_req: Optional[int] = None,
     ):
         if forward_mode.is_decode_or_idle():
-            decode_wrappers = []
-            for i in range(self.num_wrappers):
-                decode_wrappers.append(
-                    BatchDecodeWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.decode_backend,
-                        use_cuda_graph=True,
-                        use_tensor_cores=self.decode_use_tensor_cores,
-                        paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
-                        paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buffer=self.kv_last_page_len[
-                            :num_tokens
-                        ],
+            if bs <= 0:
+                raise ValueError(f"Invalid decode batch size for cuda graph capture: {bs}.")
+            if decode_q_len_per_req is None:
+                if num_tokens % bs != 0:
+                    raise ValueError(
+                        "Decode cuda graph capture expects num_tokens to be divisible by bs. "
+                        f"Got num_tokens={num_tokens}, bs={bs}."
                     )
+                decode_q_len_per_req = max(1, num_tokens // bs)
+            else:
+                decode_q_len_per_req = int(decode_q_len_per_req)
+                if decode_q_len_per_req < 1:
+                    raise ValueError(
+                        f"decode_q_len_per_req must be >= 1, got {decode_q_len_per_req}."
+                    )
+                expected_num_tokens = bs * decode_q_len_per_req
+                if expected_num_tokens != num_tokens:
+                    raise ValueError(
+                        "Inconsistent decode capture shape for cuda graph metadata: "
+                        f"bs={bs}, decode_q_len_per_req={decode_q_len_per_req}, "
+                        f"expected_num_tokens={expected_num_tokens}, actual_num_tokens={num_tokens}."
+                    )
+            decode_key = (bs, decode_q_len_per_req)
+            self.decode_cuda_graph_q_len_per_req[bs] = decode_q_len_per_req
+
+            # Decode with q_len>1 (MTP steady/seed multi-query rows) must use
+            # prefill-style planning to preserve causal intra-row attention.
+            #
+            # NOTE: Temporarily disabled for cuda-graph capture/replay because
+            # q_len>1 decode-as-prefill path is producing incorrect logits.
+            # Keep eager decode behavior unchanged.
+            use_decode_as_prefill_cuda_graph = False
+            if (
+                use_decode_as_prefill_cuda_graph
+                and forward_mode.is_decode()
+                and decode_q_len_per_req > 1
+            ):
+                if self.skip_prefill:
+                    raise ValueError(
+                        "decode_q_len_per_req>1 cuda graph capture requires prefill wrappers."
+                    )
+                # Lazy graph capture uses synthetic placeholders that may have
+                # seq_lens < decode_q_len_per_req (e.g., seq_lens=1). Clamp the
+                # synthetic capture shape so decode-as-prefill metadata remains valid.
+                seq_lens_for_capture = seq_lens
+                if torch.any(seq_lens_for_capture < decode_q_len_per_req):
+                    seq_lens_for_capture = torch.maximum(
+                        seq_lens_for_capture,
+                        torch.full_like(seq_lens_for_capture, decode_q_len_per_req),
+                    )
+                prefix_lens = seq_lens_for_capture - decode_q_len_per_req
+                prefill_wrappers = []
+                for i in range(self.num_wrappers):
+                    prefill_wrappers.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend=self.prefill_backend,
+                            use_cuda_graph=True,
+                            qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                            paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                            paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                            paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                            custom_mask_buf=self.cuda_graph_custom_mask,
+                            mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        )
+                    )
+                seq_lens_sum = seq_lens_for_capture.sum().item()
+                self.indices_updater_prefill.update(
+                    req_pool_indices,
+                    seq_lens_for_capture,
+                    seq_lens_for_capture.cpu(),  # may add a little overhead in capture stage
+                    seq_lens_sum,
+                    prefix_lens=prefix_lens,
+                    prefill_wrappers=prefill_wrappers,
+                    use_ragged=False,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                    fixed_split_size=self.prefill_split_tile_size,
                 )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_decode.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
-                decode_q_len_per_req=1,
-                decode_wrappers=decode_wrappers,
-                encoder_lens=encoder_lens,
-                spec_info=spec_info,
-                fixed_split_size=None,
-                disable_split_kv=self.disable_cuda_graph_kv_split,
-            )
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
-            self.forward_metadata = DecodeMetadata(decode_wrappers)
-            for i in range(self.num_wrappers):
-                decode_wrappers[i].begin_forward = partial(
-                    fast_decode_plan, decode_wrappers[i]
+                self.decode_prefill_cuda_graph_metadata[decode_key] = prefill_wrappers
+                self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+            else:
+                decode_wrappers = []
+                for i in range(self.num_wrappers):
+                    decode_wrappers.append(
+                        BatchDecodeWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend=self.decode_backend,
+                            use_cuda_graph=True,
+                            use_tensor_cores=self.decode_use_tensor_cores,
+                            # In decode mode, flashinfer expects per-request metadata
+                            # buffers sized by batch size, not by total query tokens.
+                            paged_kv_indptr_buffer=self.kv_indptr[i][: bs + 1],
+                            paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                            paged_kv_last_page_len_buffer=self.kv_last_page_len[:bs],
+                        )
+                    )
+                seq_lens_sum = seq_lens.sum().item()
+                self.indices_updater_decode.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens.cpu(),  # may add a little overhead in capture stage
+                    seq_lens_sum,
+                    decode_q_len_per_req=decode_q_len_per_req,
+                    decode_wrappers=decode_wrappers,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                    fixed_split_size=None,
+                    disable_split_kv=self.disable_cuda_graph_kv_split,
                 )
+                self.decode_cuda_graph_metadata[decode_key] = decode_wrappers
+                self.forward_metadata = DecodeMetadata(decode_wrappers)
+                for i in range(self.num_wrappers):
+                    decode_wrappers[i].begin_forward = partial(
+                        fast_decode_plan, decode_wrappers[i]
+                    )
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
@@ -721,20 +807,74 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        decode_q_len_per_req: Optional[int] = None,
     ):
         if forward_mode.is_decode_or_idle():
-            self.indices_updater_decode.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                seq_lens_sum,
-                decode_q_len_per_req=1,
-                decode_wrappers=self.decode_cuda_graph_metadata[bs],
-                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                spec_info=spec_info,
-                fixed_split_size=None,
-                disable_split_kv=self.disable_cuda_graph_kv_split,
-            )
+            if decode_q_len_per_req is None:
+                decode_q_len_per_req = self.decode_cuda_graph_q_len_per_req.get(bs, 1)
+            decode_q_len_per_req = int(decode_q_len_per_req)
+            decode_key = (bs, decode_q_len_per_req)
+            # Keep capture/replay policy aligned: decode-as-prefill is disabled
+            # for cuda-graph q_len>1 until correctness is restored.
+            use_decode_as_prefill_cuda_graph = False
+            if (
+                use_decode_as_prefill_cuda_graph
+                and forward_mode.is_decode()
+                and decode_q_len_per_req > 1
+            ):
+                prefill_wrappers = self.decode_prefill_cuda_graph_metadata.get(decode_key)
+                if prefill_wrappers is None:
+                    raise KeyError(
+                        "Missing decode-as-prefill cuda graph metadata for "
+                        f"bs={bs}, decode_q_len_per_req={decode_q_len_per_req}."
+                    )
+                seq_lens_local = seq_lens[:bs]
+                # Padded rows can use synthetic seq_lens values below q_len.
+                # Clamp them for decode-as-prefill metadata replay.
+                if torch.any(seq_lens_local < decode_q_len_per_req):
+                    seq_lens_local = torch.maximum(
+                        seq_lens_local,
+                        torch.full_like(seq_lens_local, decode_q_len_per_req),
+                    )
+                prefix_lens = seq_lens_local - decode_q_len_per_req
+                seq_lens_cpu_local = seq_lens_local.cpu()
+                seq_lens_sum_local = int(seq_lens_local.sum().item())
+                self.indices_updater_prefill.update(
+                    req_pool_indices[:bs],
+                    seq_lens_local,
+                    seq_lens_cpu_local,
+                    seq_lens_sum_local,
+                    prefix_lens=prefix_lens,
+                    prefill_wrappers=prefill_wrappers,
+                    use_ragged=False,
+                    encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                    spec_info=spec_info,
+                    fixed_split_size=self.prefill_split_tile_size,
+                )
+                self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+            else:
+                decode_wrappers = self.decode_cuda_graph_metadata.get(decode_key)
+                if decode_wrappers is None:
+                    # Backward-compatible fallback for old single-key captures.
+                    decode_wrappers = self.decode_cuda_graph_metadata.get(bs)
+                if decode_wrappers is None:
+                    raise KeyError(
+                        "Missing decode cuda graph metadata for "
+                        f"bs={bs}, decode_q_len_per_req={decode_q_len_per_req}."
+                    )
+                self.indices_updater_decode.update(
+                    req_pool_indices[:bs],
+                    seq_lens[:bs],
+                    seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                    seq_lens_sum,
+                    decode_q_len_per_req=decode_q_len_per_req,
+                    decode_wrappers=decode_wrappers,
+                    encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                    spec_info=spec_info,
+                    fixed_split_size=None,
+                    disable_split_kv=self.disable_cuda_graph_kv_split,
+                )
+                self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
@@ -746,6 +886,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_cuda_graph_metadata[bs], False, False
             )
         elif forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
@@ -759,6 +902,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_cuda_graph_metadata[bs], False, False
+            )
         elif forward_mode.is_dllm_extend():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
@@ -770,6 +916,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=True,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_cuda_graph_metadata[bs], True, False
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -1137,7 +1286,12 @@ class FlashInferIndicesUpdaterDecode:
 
             if wrapper.is_cuda_graph_enabled:
                 # Directly write to the cuda graph input buffer
-                kv_indices = wrapper._paged_kv_indices_buf
+                # Slice to active working size to mirror eager behavior and
+                # avoid passing oversized stale regions as active kv indices.
+                active_kv_indices_len = min(
+                    paged_kernel_lens_sum, wrapper._paged_kv_indices_buf.numel()
+                )
+                kv_indices = wrapper._paged_kv_indices_buf[:active_kv_indices_len]
             else:
                 kv_indices = torch.empty(
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
@@ -1424,11 +1578,21 @@ class FlashInferIndicesUpdaterPrefill:
             # Normal extend
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
-            kv_indices = torch.empty(
-                paged_kernel_lens_sum + 256,
-                dtype=torch.int32,
-                device=req_pool_indices.device,
-            )
+            if wrapper_paged.is_cuda_graph_enabled:
+                # In cuda graph mode, write directly into the fixed paged-kv
+                # indices buffer used by the wrapper to keep replay deterministic.
+                # Slice to the active working size to mirror eager behavior and
+                # avoid passing an oversized tensor as active kv indices.
+                active_kv_indices_len = min(
+                    paged_kernel_lens_sum + 256, wrapper_paged._paged_kv_indices_buf.numel()
+                )
+                kv_indices = wrapper_paged._paged_kv_indices_buf[:active_kv_indices_len]
+            else:
+                kv_indices = torch.empty(
+                    paged_kernel_lens_sum + 256,
+                    dtype=torch.int32,
+                    device=req_pool_indices.device,
+                )
             create_flashinfer_kv_indices_triton[(bs,)](
                 self.req_to_token,
                 req_pool_indices,

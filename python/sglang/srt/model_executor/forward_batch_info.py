@@ -281,6 +281,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mtp_emit_start_per_req: int = 0
     mtp_emit_len_per_req: int = 1
     mtp_phase: str = ""
+    mtp_strategy_kind: Optional[str] = None
+    mtp_conf_threshold: Optional[float] = None
+    mtp_decode_k_per_req: Optional[List[int]] = None
     mtp_debug_trace_enabled_per_req: Optional[List[bool]] = None
     mtp_debug_step_idx_per_req: Optional[List[int]] = None
 
@@ -393,6 +396,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mtp_emit_start_per_req=batch.mtp_emit_start_per_req,
             mtp_emit_len_per_req=batch.mtp_emit_len_per_req,
             mtp_phase=batch.mtp_phase,
+            mtp_strategy_kind=batch.mtp_strategy_kind,
+            mtp_conf_threshold=batch.mtp_conf_threshold,
+            mtp_decode_k_per_req=batch.mtp_decode_k_per_req,
             mtp_debug_trace_enabled_per_req=batch.mtp_debug_trace_enabled_per_req,
             mtp_debug_step_idx_per_req=batch.mtp_debug_step_idx_per_req,
             req_pool_indices=batch.req_pool_indices,

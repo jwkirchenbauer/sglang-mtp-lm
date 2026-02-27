@@ -105,8 +105,8 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 MTP_OVERLAP_ERROR_MSG = (
-    "MTP currently requires overlap scheduler to be disabled. "
-    "Start server with --disable-overlap-schedule."
+    "Temporary phase-2A policy: MTP decode currently requires "
+    "--disable-overlap-schedule while static/conf_adapt CUDA graph stability is being finalized."
 )
 
 
@@ -577,12 +577,19 @@ class Req(ReqDllmMixin):
         self.mtp_pending_tokens: List[int] = []
         self.mtp_effective_k: int = 1
         self.mtp_commit_len: int = 0
+        self.mtp_overlap_pending_token_refs: List[int] = []
+        self.mtp_overlap_effective_k: Optional[int] = None
+        self.mtp_overlap_commit_len: int = 0
+        self.mtp_overlap_next_phase: Optional[str] = None
+        self.mtp_overlap_pending_step_idx: int = -1
+        self.mtp_overlap_prev_step_cache_loc: Optional[torch.Tensor] = None
         self.mtp_seed_anchor_adjusted: bool = False
         self.mtp_seed_anchor_old_last_loc: Optional[int] = None
         self.mtp_debug_trace_enabled: bool = False
         self.mtp_debug_max_steps: int = 4
         self.mtp_debug_trace: List[Dict[str, Any]] = []
         self.mtp_debug_logged_first_argmax: bool = False
+        self.mtp_strategy_kind: Optional[str] = None
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -615,6 +622,9 @@ class Req(ReqDllmMixin):
             self.sampling_params.mtp_k
             if getattr(self.sampling_params, "mtp_enabled", False)
             else 1
+        )
+        self.mtp_strategy_kind = getattr(
+            self.sampling_params, "mtp_strategy_kind", None
         )
         custom_params = (
             self.sampling_params.custom_params
@@ -869,6 +879,83 @@ class Req(ReqDllmMixin):
         except Exception:
             # Debug-only path: never fail request processing because of trace decoding.
             return ""
+
+    def mtp_is_conf_adapt(self) -> bool:
+        return bool(
+            getattr(self.sampling_params, "mtp_enabled", False)
+            and self.mtp_strategy_kind == "conf_adapt"
+        )
+
+    def mtp_phase_for_step(self) -> str:
+        if self.mtp_overlap_next_phase is not None:
+            return self.mtp_overlap_next_phase
+        return self.mtp_phase
+
+    def mtp_effective_k_for_step(self) -> int:
+        if self.mtp_overlap_effective_k is not None:
+            return int(self.mtp_overlap_effective_k)
+        return int(self.mtp_effective_k)
+
+    def mtp_pending_tokens_for_step(self) -> List[int]:
+        if self.mtp_overlap_pending_token_refs:
+            return self.mtp_overlap_pending_token_refs
+        return self.mtp_pending_tokens
+
+    def mtp_committed_len_for_decode_base(self) -> int:
+        return int(self.kv_committed_len + self.mtp_overlap_commit_len)
+
+    def clear_mtp_overlap_provisional(self, upto_step_idx: Optional[int] = None) -> None:
+        if (
+            upto_step_idx is not None
+            and self.mtp_overlap_pending_step_idx > int(upto_step_idx)
+        ):
+            # Keep newer unresolved relay metadata.
+            return
+        self.mtp_overlap_pending_token_refs = []
+        self.mtp_overlap_effective_k = None
+        self.mtp_overlap_commit_len = 0
+        self.mtp_overlap_next_phase = None
+        self.mtp_overlap_pending_step_idx = -1
+
+    def mtp_decode_k_for_step(self) -> int:
+        if not getattr(self.sampling_params, "mtp_enabled", False):
+            return 1
+        phase_for_step = self.mtp_phase_for_step()
+        if phase_for_step == "seed":
+            return int(self.sampling_params.mtp_k)
+
+        if self.mtp_is_conf_adapt():
+            return max(
+                1,
+                min(int(self.mtp_effective_k_for_step()), int(self.sampling_params.mtp_k)),
+            )
+
+        return int(self.sampling_params.mtp_k)
+
+    def mtp_decode_q_len_for_step(self) -> int:
+        decode_k = self.mtp_decode_k_for_step()
+        if self.mtp_phase_for_step() == "seed":
+            return decode_k
+        return 2 * decode_k - 1
+
+    def mtp_emit_window_for_step(self) -> Tuple[int, int]:
+        decode_k = self.mtp_decode_k_for_step()
+        if self.mtp_phase_for_step() == "seed":
+            return 0, decode_k
+        return decode_k - 1, decode_k
+
+    def mtp_decode_bucket_key(self) -> Tuple[bool, str, int, int, Optional[str]]:
+        is_mtp = bool(getattr(self.sampling_params, "mtp_enabled", False))
+        if not is_mtp:
+            return (False, "", 1, 1, None)
+        decode_k = self.mtp_decode_k_for_step()
+        return (
+            True,
+            self.mtp_phase_for_step(),
+            decode_k,
+            self.mtp_decode_q_len_for_step(),
+            self.mtp_strategy_kind,
+        )
 
     def mtp_debug_upsert_step(self, step_idx: int, fields: Dict[str, Any]) -> None:
         if not self.mtp_debug_trace_enabled:
@@ -1217,7 +1304,14 @@ class Req(ReqDllmMixin):
             if getattr(self.sampling_params, "mtp_enabled", False)
             else 1
         )
+        self.mtp_strategy_kind = getattr(self.sampling_params, "mtp_strategy_kind", None)
         self.mtp_commit_len = 0
+        self.mtp_overlap_pending_token_refs = []
+        self.mtp_overlap_effective_k = None
+        self.mtp_overlap_commit_len = 0
+        self.mtp_overlap_next_phase = None
+        self.mtp_overlap_pending_step_idx = -1
+        self.mtp_overlap_prev_step_cache_loc = None
         self.mtp_seed_anchor_adjusted = False
         self.mtp_seed_anchor_old_last_loc = None
         self.swa_evicted_seqlen = 0
@@ -1330,6 +1424,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mtp_emit_start_per_req: int = 0
     mtp_emit_len_per_req: int = 1
     mtp_phase: str = ""
+    mtp_strategy_kind: Optional[str] = None
+    mtp_conf_threshold: Optional[float] = None
+    mtp_decode_k_per_req: Optional[List[int]] = None
     mtp_debug_trace_enabled_per_req: Optional[List[bool]] = None
     mtp_debug_step_idx_per_req: Optional[List[int]] = None
 
@@ -1907,7 +2004,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
         if self.spec_algorithm.is_none():
-            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
+            new_pages = 0
+            for r in requests:
+                committed_len = (
+                    r.mtp_committed_len_for_decode_base()
+                    if getattr(r.sampling_params, "mtp_enabled", False)
+                    else int(r.kv_committed_len)
+                )
+                if committed_len % page_size == 0:
+                    new_pages += 1
             return new_pages * page_size
 
         server_args = get_global_server_args()
@@ -2032,6 +2137,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.decode_q_len_per_req = 1
+        self.mtp_phase = ""
+        self.mtp_strategy_kind = None
+        self.mtp_conf_threshold = None
+        self.mtp_decode_k_per_req = None
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
@@ -2049,13 +2158,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mtp_enabled_reqs = [
             req for req in self.reqs if getattr(req.sampling_params, "mtp_enabled", False)
         ]
+        if self.enable_overlap and mtp_enabled_reqs:
+            raise ValueError(MTP_OVERLAP_ERROR_MSG)
         mtp_ks = [req.sampling_params.mtp_k for req in mtp_enabled_reqs]
-        mtp_phases = [req.mtp_phase for req in mtp_enabled_reqs]
+        mtp_phases = [req.mtp_phase_for_step() for req in mtp_enabled_reqs]
 
         # One-time MTP seed anchor correction:
         # In seed phase for k>1, we recompute the last prompt token, so the logical
         # decode base should be prompt_len - 1 (HF parity).
         if mtp_enabled_reqs:
+            # In overlap mode, unresolved MTP steps may leave speculative tail cache
+            # locations that are no longer needed once effective-k is known.
+            # Free them before preparing the next decode allocation to avoid KV leaks
+            # and stale req_to_token mapping gaps.
+            for req in mtp_enabled_reqs:
+                if req.mtp_overlap_prev_step_cache_loc is not None:
+                    self.token_to_kv_pool_allocator.free(req.mtp_overlap_prev_step_cache_loc)
+                    req.kv_allocated_len -= int(req.mtp_overlap_prev_step_cache_loc.numel())
+                    req.mtp_overlap_prev_step_cache_loc = None
+                    if req.kv_allocated_len < req.kv_committed_len:
+                        raise ValueError(
+                            "Invalid KV lengths after freeing overlap MTP tail cache: "
+                            f"{req.kv_committed_len=} > {req.kv_allocated_len=}"
+                        )
             for req in mtp_enabled_reqs:
                 if (
                     req.sampling_params.mtp_k > 1
@@ -2097,8 +2222,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if not self.model_config.is_encoder_decoder:
             if mtp_enabled_reqs:
                 # For MTP delayed-commit decode, logical decode base length must follow
-                # committed KV cache length, not emitted token count.
-                seq_lens_list = [req.kv_committed_len for req in self.reqs]
+                # committed KV cache length, including unresolved overlap commit delta.
+                seq_lens_list = [req.mtp_committed_len_for_decode_base() for req in self.reqs]
             else:
                 seq_lens_list = [req.seqlen for req in self.reqs]
             self.seq_lens = torch.tensor(
@@ -2114,6 +2239,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         token_per_req = 1
         mtp_emit_start = 0
         mtp_emit_len = 1
+        self.mtp_phase = ""
+        self.mtp_strategy_kind = None
+        self.mtp_conf_threshold = None
+        self.mtp_decode_k_per_req = None
         if mtp_enabled_reqs:
             if get_global_server_args().attention_backend != "flashinfer":
                 raise ValueError(
@@ -2131,21 +2260,44 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 raise ValueError(
                     f"Mixed mtp_phase in the same decode batch is not supported yet: {sorted(set(mtp_phases))}"
                 )
-            mtp_k = mtp_ks[0]
-            if mtp_phases[0] == "seed":
-                token_per_req = mtp_k
-                mtp_emit_start = 0
-                mtp_emit_len = mtp_k
-            elif mtp_phases[0] == "steady":
-                token_per_req = 2 * mtp_k - 1
-                mtp_emit_start = mtp_k - 1
-                mtp_emit_len = mtp_k
-            else:
-                raise ValueError(f"Invalid mtp_phase: {mtp_phases[0]}")
-            if mtp_emit_len != mtp_k:
+
+            mtp_strategy_kinds = [req.mtp_strategy_kind for req in mtp_enabled_reqs]
+            if len(set(mtp_strategy_kinds)) != 1:
                 raise ValueError(
-                    f"MTP emit length must equal mtp_k. Got emit_len={mtp_emit_len}, mtp_k={mtp_k}."
+                    "Mixed MTP strategy kinds in the same decode batch are not supported yet: "
+                    f"{sorted(set(mtp_strategy_kinds))}"
                 )
+
+            mtp_decode_ks = [req.mtp_decode_k_for_step() for req in mtp_enabled_reqs]
+            mtp_q_lens = [req.mtp_decode_q_len_for_step() for req in mtp_enabled_reqs]
+            mtp_emit_windows = [req.mtp_emit_window_for_step() for req in mtp_enabled_reqs]
+            if len(set(mtp_q_lens)) != 1:
+                raise ValueError(
+                    "Mixed MTP decode shapes in the same decode batch are not supported yet: "
+                    f"{sorted(set(mtp_q_lens))}."
+                )
+            if len(set(mtp_emit_windows)) != 1:
+                raise ValueError(
+                    "Mixed MTP emit windows in the same decode batch are not supported yet: "
+                    f"{sorted(set(mtp_emit_windows))}."
+                )
+
+            token_per_req = mtp_q_lens[0]
+            mtp_emit_start, mtp_emit_len = mtp_emit_windows[0]
+            self.mtp_phase = mtp_phases[0]
+            self.mtp_strategy_kind = mtp_strategy_kinds[0]
+            if self.mtp_strategy_kind == "conf_adapt":
+                conf_thresholds = {
+                    float(req.sampling_params.mtp_conf_threshold)
+                    for req in mtp_enabled_reqs
+                }
+                if len(conf_thresholds) != 1:
+                    raise ValueError(
+                        "Mixed conf_adapt thresholds in the same decode batch are not supported yet: "
+                        f"{sorted(conf_thresholds)}"
+                    )
+                self.mtp_conf_threshold = next(iter(conf_thresholds))
+            self.mtp_decode_k_per_req = mtp_decode_ks
         if mtp_emit_start < 0 or mtp_emit_start >= token_per_req:
             raise ValueError(
                 f"Invalid MTP emit start {mtp_emit_start} for token_per_req={token_per_req}."
@@ -2158,7 +2310,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.decode_q_len_per_req = token_per_req
         self.mtp_emit_start_per_req = mtp_emit_start
         self.mtp_emit_len_per_req = mtp_emit_len
-        self.mtp_phase = mtp_phases[0] if mtp_enabled_reqs else ""
         self.mtp_debug_trace_enabled_per_req = [
             bool(getattr(req, "mtp_debug_trace_enabled", False)) for req in self.reqs
         ]
@@ -2202,10 +2353,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mask_rows = []
             for i, req in enumerate(self.reqs):
                 row = []
-                mtp_k = req.sampling_params.mtp_k
-                req.mtp_effective_k = mtp_k
+                decode_k = req.mtp_decode_k_for_step()
+                phase_for_step = req.mtp_phase_for_step()
+                pending_tokens_for_step = req.mtp_pending_tokens_for_step()
 
-                if req.mtp_phase == "seed":
+                if phase_for_step == "seed":
                     if isinstance(self.output_ids, torch.Tensor):
                         if self.output_ids.ndim == 1:
                             last_token = int(self.output_ids[i].item())
@@ -2217,12 +2369,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     row.append(last_token)
                     req.mtp_commit_len = 1
                 else:
-                    if len(req.mtp_pending_tokens) != mtp_k:
+                    if len(pending_tokens_for_step) != decode_k:
                         raise ValueError(
-                            f"MTP steady phase requires {mtp_k} pending tokens, got {len(req.mtp_pending_tokens)}."
+                            "MTP steady phase requires pending tokens to match decode_k. "
+                            f"Expected {decode_k}, got {len(pending_tokens_for_step)}."
                         )
-                    row.extend(req.mtp_pending_tokens)
-                    req.mtp_commit_len = mtp_k
+                    row.extend(pending_tokens_for_step[:decode_k])
+                    req.mtp_commit_len = decode_k
 
                 # Use a mask range if provided, otherwise a single mask id repeated.
                 if req.sampling_params.mtp_min_mask_id is not None:
@@ -2232,25 +2385,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         raise ValueError(
                             "mtp_max_mask_id must be provided when mtp_min_mask_id is used."
                         )
-                    for offset in range(mtp_k - 1):
+                    for offset in range(decode_k - 1):
                         mask_id = min_mask + offset
                         if mask_id > max_mask:
                             raise ValueError(
-                                f"Mask range exhausted for mtp_k={mtp_k}: {mask_id=} > {max_mask=}."
+                                f"Mask range exhausted for decode_k={decode_k}: {mask_id=} > {max_mask=}."
                             )
                         row.append(mask_id)
                 else:
                     assert req.sampling_params.mtp_mask_id is not None
-                    row.extend([req.sampling_params.mtp_mask_id] * (mtp_k - 1))
+                    row.extend([req.sampling_params.mtp_mask_id] * (decode_k - 1))
 
                 if len(row) != token_per_req:
                     raise ValueError(
                         f"Unexpected MTP decode row length {len(row)} for req {req.rid}, expected {token_per_req}."
                     )
+                emit_start_i, emit_len_i = req.mtp_emit_window_for_step()
                 req.mtp_debug_upsert_step(
                     req.decode_batch_idx,
                     {
-                        "phase": req.mtp_phase,
+                        "phase": phase_for_step,
+                        "strategy_kind": req.mtp_strategy_kind,
+                        "decode_k_for_step": int(decode_k),
+                        "conf_threshold": (
+                            float(req.sampling_params.mtp_conf_threshold)
+                            if req.sampling_params.mtp_conf_threshold is not None
+                            else None
+                        ),
                         "decode_q_len_per_req": int(token_per_req),
                         "seed_anchor_adjusted": bool(req.mtp_seed_anchor_adjusted),
                         "kv_committed_len_effective_base": int(
@@ -2258,8 +2419,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         ),
                         "input_row_token_ids": req._mtp_debug_cap_token_ids(row),
                         "emit_window": {
-                            "start": int(self.mtp_emit_start_per_req),
-                            "len": int(self.mtp_emit_len_per_req),
+                            "start": int(emit_start_i),
+                            "len": int(emit_len_i),
                         },
                         "seq_len_base_used_for_next_decode": int(
                             self.seq_lens_cpu[i].item()
@@ -2482,6 +2643,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mtp_emit_start_per_req=self.mtp_emit_start_per_req,
             mtp_emit_len_per_req=self.mtp_emit_len_per_req,
             mtp_phase=self.mtp_phase,
+            mtp_strategy_kind=self.mtp_strategy_kind,
+            mtp_conf_threshold=self.mtp_conf_threshold,
+            mtp_decode_k_per_req=self.mtp_decode_k_per_req,
             mtp_debug_trace_enabled_per_req=self.mtp_debug_trace_enabled_per_req,
             mtp_debug_step_idx_per_req=self.mtp_debug_step_idx_per_req,
             req_pool_indices=self.req_pool_indices,
@@ -2551,6 +2715,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mtp_emit_start_per_req=self.mtp_emit_start_per_req,
             mtp_emit_len_per_req=self.mtp_emit_len_per_req,
             mtp_phase=self.mtp_phase,
+            mtp_strategy_kind=self.mtp_strategy_kind,
+            mtp_conf_threshold=self.mtp_conf_threshold,
+            mtp_decode_k_per_req=self.mtp_decode_k_per_req,
             mtp_debug_trace_enabled_per_req=self.mtp_debug_trace_enabled_per_req,
             mtp_debug_step_idx_per_req=self.mtp_debug_step_idx_per_req,
             return_logprob=self.return_logprob,
@@ -2589,7 +2756,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # 2. Evict swa every window_size tokens to reduce the overhead.
                     if req.decode_batch_idx % sliding_window_size == 1:
                         decode_pre_len = (
-                            req.kv_committed_len
+                            req.mtp_committed_len_for_decode_base()
                             if getattr(req.sampling_params, "mtp_enabled", False)
                             else req.seqlen
                         )
@@ -2699,6 +2866,9 @@ class ModelWorkerBatch:
     mtp_emit_start_per_req: int = 0
     mtp_emit_len_per_req: int = 1
     mtp_phase: str = ""
+    mtp_strategy_kind: Optional[str] = None
+    mtp_conf_threshold: Optional[float] = None
+    mtp_decode_k_per_req: Optional[List[int]] = None
     mtp_debug_trace_enabled_per_req: Optional[List[bool]] = None
     mtp_debug_step_idx_per_req: Optional[List[int]] = None
 
