@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -486,6 +487,67 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    mtp_kv_leak_debug = bool(
+        envs.SGLANG_MTP_KV_LEAK_DEBUG.get()
+        and getattr(req.sampling_params, "mtp_enabled", False)
+    )
+
+    def _tensor_to_int_set(value) -> set[int]:
+        if value is None:
+            return set()
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return set()
+            return {int(x) for x in value.detach().view(-1).cpu().tolist()}
+        return {int(x) for x in value}
+
+    curr_step_tokens: set[int] = (
+        _tensor_to_int_set(req.mtp_debug_last_curr_step_cache_loc)
+        if mtp_kv_leak_debug
+        else set()
+    )
+    freed_by_tail_cleanup: set[int] = set()
+    freed_by_overalloc_range: set[int] = set()
+    retained_as_committed: set[int] = set()
+    seed_anchor_old_loc: int | None = (
+        int(req.mtp_seed_anchor_old_last_loc)
+        if mtp_kv_leak_debug
+        and getattr(req, "mtp_seed_anchor_adjusted", False)
+        and req.mtp_seed_anchor_old_last_loc is not None
+        else None
+    )
+
+    # MTP may hold unresolved tail cache locations between decode steps.
+    # Always release them here so all release call sites (finish/abort/retract)
+    # are leak-safe, even if they do not run decode-specific cleanup first.
+    if req.mtp_prev_step_cache_loc is not None:
+        if mtp_kv_leak_debug:
+            freed_by_tail_cleanup.update(_tensor_to_int_set(req.mtp_prev_step_cache_loc))
+        tree_cache.token_to_kv_pool_allocator.free(req.mtp_prev_step_cache_loc)
+        req.kv_allocated_len -= int(req.mtp_prev_step_cache_loc.numel())
+        req.mtp_prev_step_cache_loc = None
+    if req.mtp_overlap_prev_step_cache_loc is not None:
+        if mtp_kv_leak_debug:
+            freed_by_tail_cleanup.update(
+                _tensor_to_int_set(req.mtp_overlap_prev_step_cache_loc)
+            )
+        tree_cache.token_to_kv_pool_allocator.free(req.mtp_overlap_prev_step_cache_loc)
+        req.kv_allocated_len -= int(req.mtp_overlap_prev_step_cache_loc.numel())
+        req.mtp_overlap_prev_step_cache_loc = None
+    if req.kv_allocated_len < req.kv_committed_len:
+        if getattr(req.sampling_params, "mtp_enabled", False):
+            logger.warning(
+                "Clamping invalid KV lengths in release_kv_cache for MTP request. "
+                f"rid={req.rid}, kv_committed_len={req.kv_committed_len}, "
+                f"kv_allocated_len={req.kv_allocated_len}"
+            )
+            req.kv_committed_len = req.kv_allocated_len
+        else:
+            raise ValueError(
+                "Invalid KV lengths after freeing MTP tail cache in release_kv_cache: "
+                f"{req.kv_committed_len=} > {req.kv_allocated_len=}"
+            )
+
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
         assert (
@@ -499,7 +561,47 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    # MTP seed-anchor correction may intentionally unprotect one cache-owned anchor
+    # token (prompt_len-1) so its recomputed replacement is treated as request-owned.
+    # If cache_protected_len was refreshed later by key-only prefix matching, rebase it
+    # back before finish release to avoid leaking that single replacement slot.
+    if (
+        getattr(req.sampling_params, "mtp_enabled", False)
+        and getattr(req, "mtp_seed_anchor_adjusted", False)
+        and req.mtp_seed_anchor_old_last_pos is not None
+        and req.mtp_seed_anchor_old_last_loc is not None
+        and req.cache_protected_len > int(req.mtp_seed_anchor_old_last_pos)
+    ):
+        seed_anchor_pos = int(req.mtp_seed_anchor_old_last_pos)
+        seed_anchor_old_loc = int(req.mtp_seed_anchor_old_last_loc)
+        if seed_anchor_pos >= 0:
+            seed_anchor_curr_loc = int(
+                tree_cache.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, seed_anchor_pos
+                ].item()
+            )
+            if seed_anchor_curr_loc != seed_anchor_old_loc:
+                cache_protected_len_before = int(req.cache_protected_len)
+                req.cache_protected_len = seed_anchor_pos
+                logger.info(
+                    "Rebased cache_protected_len before MTP release for seed-anchor ownership. "
+                    f"rid={req.rid}, "
+                    f"cache_protected_len_before={cache_protected_len_before}, "
+                    f"cache_protected_len_after={req.cache_protected_len}, "
+                    f"seed_anchor_pos={seed_anchor_pos}, "
+                    f"seed_anchor_old_loc={seed_anchor_old_loc}, "
+                    f"seed_anchor_curr_loc={seed_anchor_curr_loc}"
+                )
+
     tree_cache.cache_finished_req(req, is_insert=is_insert)
+
+    if mtp_kv_leak_debug and curr_step_tokens and req.kv_committed_len > 0:
+        committed_slice = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
+            : req.kv_committed_len
+        ]
+        retained_as_committed = curr_step_tokens.intersection(
+            _tensor_to_int_set(committed_slice)
+        )
 
     start_p, end_p = req.pop_overallocated_kv_cache()
 
@@ -519,7 +621,66 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
+        if mtp_kv_leak_debug:
+            freed_by_overalloc_range.update(_tensor_to_int_set(indices_to_free))
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+
+    if mtp_kv_leak_debug and curr_step_tokens:
+        seed_anchor_old_loc_state = "na"
+        if seed_anchor_old_loc is not None:
+            allocator = tree_cache.token_to_kv_pool_allocator
+            in_free = False
+            if len(allocator.free_pages) > 0:
+                in_free = in_free or bool(
+                    torch.any(allocator.free_pages == seed_anchor_old_loc).item()
+                )
+            if len(allocator.release_pages) > 0:
+                in_free = in_free or bool(
+                    torch.any(allocator.release_pages == seed_anchor_old_loc).item()
+                )
+            in_cached = False
+            if hasattr(tree_cache, "all_values_flatten"):
+                cached_values = tree_cache.all_values_flatten()
+                if (
+                    isinstance(cached_values, torch.Tensor)
+                    and cached_values.numel() > 0
+                ):
+                    in_cached = bool(
+                        torch.any(cached_values == seed_anchor_old_loc).item()
+                    )
+            if in_cached:
+                seed_anchor_old_loc_state = "cached"
+            elif in_free:
+                seed_anchor_old_loc_state = "free"
+            else:
+                seed_anchor_old_loc_state = "missing"
+
+        missing_from_terminal_release = curr_step_tokens.difference(
+            freed_by_tail_cleanup
+            | freed_by_overalloc_range
+            | retained_as_committed
+        )
+        logger.info(
+            "MTP terminal release ownership audit. "
+            f"rid={req.rid}, "
+            f"step={req.mtp_debug_last_step_idx}, "
+            f"phase={req.mtp_debug_last_phase}, "
+            f"req_q_len={req.mtp_debug_last_req_q_len}, "
+            f"commit_len={req.mtp_debug_last_commit_len}, "
+            f"curr_step_token_count={len(curr_step_tokens)}, "
+            f"freed_by_tail_cleanup_count={len(freed_by_tail_cleanup)}, "
+            f"freed_by_overalloc_range_count={len(freed_by_overalloc_range)}, "
+            f"retained_as_committed_count={len(retained_as_committed)}, "
+            f"missing_from_terminal_release_count={len(missing_from_terminal_release)}, "
+            f"missing_from_terminal_release_sample="
+            f"{sorted(missing_from_terminal_release)[:16]}, "
+            f"seed_anchor_old_loc={seed_anchor_old_loc}, "
+            f"seed_anchor_old_loc_state={seed_anchor_old_loc_state}"
+        )
+
+    if mtp_kv_leak_debug:
+        req.mtp_debug_last_curr_step_cache_loc = None
+
     # If the prefix cache doesn't manage mamba states, we must free them here.
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()

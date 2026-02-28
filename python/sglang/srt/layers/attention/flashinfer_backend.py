@@ -300,6 +300,57 @@ class FlashInferAttnBackend(AttentionBackend):
         self.decode_cuda_graph_q_len_per_req = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+        self.enable_mtp_static_q_len_cuda_graph = bool(
+            getattr(model_runner.server_args, "enable_mtp_static_q_len_cuda_graph", False)
+        )
+        self.q_len_gt1_decode_cuda_graph_force_eager_reason: Optional[str] = None
+        self._logged_q_len_gt1_decode_prefill_cuda_graph_state = set()
+        self._logged_q_len_gt1_decode_prefill_cuda_graph_custom_mask_warn = set()
+
+    def _should_use_decode_as_prefill_cuda_graph(
+        self, decode_q_len_per_req: int
+    ) -> bool:
+        return (
+            self.enable_mtp_static_q_len_cuda_graph and int(decode_q_len_per_req) > 1
+        )
+
+    def _inspect_decode_prefill_cuda_graph_wrapper_mask_state(
+        self,
+        decode_key,
+        prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
+        emit_debug_log: bool = True,
+    ) -> bool:
+        has_custom_mask_buf = any(
+            getattr(wrapper, "_custom_mask_buf", None) is not None
+            for wrapper in prefill_wrappers
+        )
+        if (
+            emit_debug_log
+            and decode_key not in self._logged_q_len_gt1_decode_prefill_cuda_graph_state
+        ):
+            logger.info(
+                "q>1 decode-as-prefill cuda graph wrapper state: decode_key=%s has_custom_mask_buf=%s",
+                decode_key,
+                has_custom_mask_buf,
+            )
+            self._logged_q_len_gt1_decode_prefill_cuda_graph_state.add(decode_key)
+        if has_custom_mask_buf:
+            self.q_len_gt1_decode_cuda_graph_force_eager_reason = (
+                "decode_as_prefill_custom_mask_enabled"
+            )
+            if (
+                decode_key
+                not in self._logged_q_len_gt1_decode_prefill_cuda_graph_custom_mask_warn
+            ):
+                logger.warning(
+                    "q>1 decode-as-prefill cuda graph wrapper unexpectedly has non-null custom-mask buffer "
+                    "for decode_key=%s. Forcing eager fallback for q>1 decode replay.",
+                    decode_key,
+                )
+                self._logged_q_len_gt1_decode_prefill_cuda_graph_custom_mask_warn.add(
+                    decode_key
+                )
+        return has_custom_mask_buf
 
     def _process_multi_item_scoring(
         self, forward_batch: ForwardBatch
@@ -611,22 +662,16 @@ class FlashInferAttnBackend(AttentionBackend):
             decode_key = (bs, decode_q_len_per_req)
             self.decode_cuda_graph_q_len_per_req[bs] = decode_q_len_per_req
 
-            # Decode with q_len>1 (MTP steady/seed multi-query rows) must use
-            # prefill-style planning to preserve causal intra-row attention.
-            #
-            # NOTE: Temporarily disabled for cuda-graph capture/replay because
-            # q_len>1 decode-as-prefill path is producing incorrect logits.
-            # Keep eager decode behavior unchanged.
-            use_decode_as_prefill_cuda_graph = False
-            if (
-                use_decode_as_prefill_cuda_graph
-                and forward_mode.is_decode()
-                and decode_q_len_per_req > 1
-            ):
-                if self.skip_prefill:
-                    raise ValueError(
-                        "decode_q_len_per_req>1 cuda graph capture requires prefill wrappers."
-                    )
+            use_decode_as_prefill_cuda_graph = (
+                self._should_use_decode_as_prefill_cuda_graph(decode_q_len_per_req)
+            )
+            if use_decode_as_prefill_cuda_graph and self.skip_prefill:
+                logger.warning(
+                    "q>1 decode-as-prefill cuda graph capture requested but prefill wrappers are unavailable; "
+                    "falling back to decode-wrapper capture path."
+                )
+                use_decode_as_prefill_cuda_graph = False
+            if use_decode_as_prefill_cuda_graph:
                 # Lazy graph capture uses synthetic placeholders that may have
                 # seq_lens < decode_q_len_per_req (e.g., seq_lens=1). Clamp the
                 # synthetic capture shape so decode-as-prefill metadata remains valid.
@@ -649,10 +694,11 @@ class FlashInferAttnBackend(AttentionBackend):
                             paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                             paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                             paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                            custom_mask_buf=self.cuda_graph_custom_mask,
-                            mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
                         )
                     )
+                self._inspect_decode_prefill_cuda_graph_wrapper_mask_state(
+                    decode_key, prefill_wrappers, emit_debug_log=False
+                )
                 seq_lens_sum = seq_lens_for_capture.sum().item()
                 self.indices_updater_prefill.update(
                     req_pool_indices,
@@ -814,20 +860,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 decode_q_len_per_req = self.decode_cuda_graph_q_len_per_req.get(bs, 1)
             decode_q_len_per_req = int(decode_q_len_per_req)
             decode_key = (bs, decode_q_len_per_req)
-            # Keep capture/replay policy aligned: decode-as-prefill is disabled
-            # for cuda-graph q_len>1 until correctness is restored.
-            use_decode_as_prefill_cuda_graph = False
-            if (
-                use_decode_as_prefill_cuda_graph
-                and forward_mode.is_decode()
-                and decode_q_len_per_req > 1
-            ):
+            use_decode_as_prefill_cuda_graph = (
+                self._should_use_decode_as_prefill_cuda_graph(decode_q_len_per_req)
+                and not self.skip_prefill
+            )
+            if use_decode_as_prefill_cuda_graph:
                 prefill_wrappers = self.decode_prefill_cuda_graph_metadata.get(decode_key)
                 if prefill_wrappers is None:
                     raise KeyError(
                         "Missing decode-as-prefill cuda graph metadata for "
                         f"bs={bs}, decode_q_len_per_req={decode_q_len_per_req}."
                     )
+                self._inspect_decode_prefill_cuda_graph_wrapper_mask_state(
+                    decode_key, prefill_wrappers
+                )
                 seq_lens_local = seq_lens[:bs]
                 # Padded rows can use synthetic seq_lens values below q_len.
                 # Clamp them for decode-as-prefill metadata replay.
@@ -1114,6 +1160,7 @@ class FlashInferIndicesUpdaterDecode:
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
+        self.page_size = model_runner.page_size
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
 
@@ -1342,7 +1389,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                decode_q_len_per_req,
+                self.page_size,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,
@@ -1361,7 +1408,7 @@ class FlashInferIndicesUpdaterDecode:
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                decode_q_len_per_req,
+                self.page_size,
                 data_type=self.data_type,
                 q_data_type=self.q_data_type,
                 non_blocking=True,

@@ -246,7 +246,7 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
-_LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_WARNING = False
+_LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_REASONS = set()
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -2157,6 +2157,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             },
         )
         self.graph_runner = graph_runners[self.device](self)
+        self._init_mtp_static_cuda_graph_runners()
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2164,6 +2165,105 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+    def _get_mtp_static_cuda_graph_capture_q_lens(self) -> List[int]:
+        k_list = getattr(self.server_args, "mtp_static_cuda_graph_k_list", None) or []
+        q_lens = set()
+        for k in k_list:
+            k = int(k)
+            q_lens.add(k)
+            q_lens.add(2 * k - 1)
+        return sorted(q_len for q_len in q_lens if q_len > 1)
+
+    def _is_flashinfer_workspace_overflow_error(self, exc: Exception) -> bool:
+        msg = str(exc)
+        return (
+            "Buffer overflow when allocating memory" in msg
+            or "Increase the workspace buffer size" in msg
+        )
+
+    def _get_mtp_static_cuda_graph_bs_candidates(self) -> List[int]:
+        base_bs = list(getattr(self.server_args, "cuda_graph_bs", []) or [])
+        if len(base_bs) == 0:
+            return []
+
+        max_bs = max(base_bs)
+        caps = [max_bs, 128, 112, 96, 80, 72, 64, 56, 48, 40, 32, 24, 16, 12, 8]
+        caps = [cap for cap in caps if cap <= max_bs and cap > 0]
+        caps.extend(sorted(base_bs, reverse=True))
+        # Keep order while deduplicating.
+        deduped_caps = list(dict.fromkeys(caps))
+        return deduped_caps
+
+    def _init_mtp_static_cuda_graph_runners(self):
+        if self.device == "cpu" or not isinstance(self.graph_runner, CudaGraphRunner):
+            return
+        if not bool(
+            getattr(self.server_args, "enable_mtp_static_q_len_cuda_graph", False)
+        ):
+            return
+
+        capture_q_lens = self._get_mtp_static_cuda_graph_capture_q_lens()
+        if len(capture_q_lens) == 0:
+            logger.warning(
+                "Static MTP q>1 cuda graph is enabled but configured k-list does not produce q_len>1 captures. "
+                "q_len>1 decode will stay eager."
+            )
+            return
+
+        logger.info(
+            "Capture static MTP q>1 cuda graph runners. q_lens=%s",
+            capture_q_lens,
+        )
+        original_cuda_graph_bs = list(getattr(self.server_args, "cuda_graph_bs", []) or [])
+        bs_caps = self._get_mtp_static_cuda_graph_bs_candidates()
+        if len(bs_caps) == 0:
+            logger.warning(
+                "No cuda_graph_bs available for static MTP q>1 pre-capture; q_len>1 decode will stay eager."
+            )
+            return
+
+        for decode_q_len in capture_q_lens:
+            captured = False
+            last_workspace_err = None
+            for cap in bs_caps:
+                scoped_bs = [bs for bs in original_cuda_graph_bs if bs <= cap]
+                if len(scoped_bs) == 0:
+                    continue
+                try:
+                    self.server_args.cuda_graph_bs = list(scoped_bs)
+                    self.mtp_decode_graph_runners[decode_q_len] = CudaGraphRunner(
+                        self,
+                        decode_num_tokens_per_bs=decode_q_len,
+                        lazy_capture=False,
+                    )
+                    if cap < max(original_cuda_graph_bs):
+                        logger.warning(
+                            "Captured static MTP q_len=%d with reduced cuda_graph_bs cap=%d due workspace limits.",
+                            decode_q_len,
+                            cap,
+                        )
+                    captured = True
+                    break
+                except Exception as exc:
+                    if self._is_flashinfer_workspace_overflow_error(exc):
+                        last_workspace_err = exc
+                        logger.warning(
+                            "Static MTP q_len=%d pre-capture overflow at cap=%d, retrying smaller cap.",
+                            decode_q_len,
+                            cap,
+                        )
+                        continue
+                    raise
+                finally:
+                    self.server_args.cuda_graph_bs = list(original_cuda_graph_bs)
+
+            if not captured:
+                logger.warning(
+                    "Failed to pre-capture static MTP q_len=%d due workspace limits. Falling back to eager for this q_len. last_error=%s",
+                    decode_q_len,
+                    str(last_workspace_err) if last_workspace_err is not None else "n/a",
+                )
 
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""
@@ -2243,23 +2343,55 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _get_graph_runner_for_forward_batch(self, forward_batch: ForwardBatch):
         graph_runner = self.graph_runner
         if (
-            graph_runner is not None
-            and isinstance(graph_runner, CudaGraphRunner)
+            isinstance(graph_runner, CudaGraphRunner)
             and self.device != "cpu"
             and forward_batch.forward_mode.is_decode()
             and int(forward_batch.decode_q_len_per_req) > 1
         ):
             decode_q_len = int(forward_batch.decode_q_len_per_req)
-            cached_runner = self.mtp_decode_graph_runners.get(decode_q_len)
-            if cached_runner is None:
-                cached_runner = CudaGraphRunner(
-                    self,
-                    decode_num_tokens_per_bs=decode_q_len,
-                    lazy_capture=True,
-                )
-                self.mtp_decode_graph_runners[decode_q_len] = cached_runner
-            graph_runner = cached_runner
+            graph_runner = self.mtp_decode_graph_runners.get(decode_q_len)
         return graph_runner
+
+    def is_q_len_gt1_graph_eligible(
+        self, forward_batch: ForwardBatch
+    ) -> Tuple[bool, str]:
+        if not forward_batch.forward_mode.is_decode():
+            return False, "not_decode"
+        if int(getattr(forward_batch, "decode_q_len_per_req", 1)) <= 1:
+            return False, "q_len_le_1"
+        if not bool(
+            getattr(self.server_args, "enable_mtp_static_q_len_cuda_graph", False)
+        ):
+            return False, "flag_disabled"
+        force_eager_reason = getattr(
+            self.attn_backend, "q_len_gt1_decode_cuda_graph_force_eager_reason", None
+        )
+        if (
+            force_eager_reason is None
+            and getattr(self.server_args, "enable_pdmux", False)
+            and getattr(self, "decode_attn_backend_group", None) is not None
+        ):
+            for decode_backend in self.decode_attn_backend_group:
+                force_eager_reason = getattr(
+                    decode_backend, "q_len_gt1_decode_cuda_graph_force_eager_reason", None
+                )
+                if force_eager_reason is not None:
+                    break
+        if force_eager_reason is not None:
+            return False, str(force_eager_reason)
+
+        # q_len>1 graph replay is staged only for static MTP decode (seed/steady)
+        # with startup pre-captured q-lens.
+        phase = getattr(forward_batch, "mtp_phase", None)
+        if phase not in {"seed", "steady"}:
+            return False, f"phase_{phase}"
+        strategy_kind = getattr(forward_batch, "mtp_strategy_kind", None)
+        if strategy_kind is not None:
+            return False, f"strategy_{strategy_kind}"
+        decode_q_len = int(getattr(forward_batch, "decode_q_len_per_req", 1))
+        if decode_q_len not in self.mtp_decode_graph_runners:
+            return False, "q_len_not_precaptured"
+        return True, "eligible"
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
@@ -2477,29 +2609,55 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device == "cpu"
             else forward_batch.forward_mode.is_cuda_graph
         )
-        global _LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_WARNING
+        global _LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_REASONS
         q_len_gt1_decode = bool(
             forward_batch.forward_mode.is_decode()
             and int(forward_batch.decode_q_len_per_req) > 1
         )
         if q_len_gt1_decode:
-            graph_runner = None
-            can_run_graph = False
-            if not _LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_WARNING:
-                _LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_WARNING = True
-                logger.warning(
-                    "Temporary phase-2A policy: bypassing cuda graph replay for decode_q_len_per_req>1 "
-                    "pending q>1 stabilization. payload=%s",
-                    {
-                        "decode_q_len_per_req": int(
-                            forward_batch.decode_q_len_per_req
-                        ),
-                        "mtp_phase": getattr(forward_batch, "mtp_phase", None),
-                        "mtp_strategy_kind": getattr(
-                            forward_batch, "mtp_strategy_kind", None
-                        ),
-                    },
+            is_eligible, bypass_reason = self.is_q_len_gt1_graph_eligible(forward_batch)
+            if is_eligible:
+                graph_runner = self._get_graph_runner_for_forward_batch(forward_batch)
+                can_run_graph = bool(
+                    mode_check()
+                    and graph_runner
+                    and graph_runner.can_run(forward_batch)
                 )
+            else:
+                graph_runner = None
+                can_run_graph = False
+                if bypass_reason not in _LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_REASONS:
+                    _LOGGED_Q_LEN_GT1_DECODE_GRAPH_BYPASS_REASONS.add(bypass_reason)
+                    logger.warning(
+                        "Bypassing q>1 decode cuda graph replay. reason=%s payload=%s",
+                        bypass_reason,
+                        {
+                            "decode_q_len_per_req": int(
+                                forward_batch.decode_q_len_per_req
+                            ),
+                            "mtp_phase": getattr(forward_batch, "mtp_phase", None),
+                            "mtp_strategy_kind": getattr(
+                                forward_batch, "mtp_strategy_kind", None
+                            ),
+                            "enable_mtp_static_q_len_cuda_graph": bool(
+                                getattr(
+                                    self.server_args,
+                                    "enable_mtp_static_q_len_cuda_graph",
+                                    False,
+                                )
+                            ),
+                            "mtp_static_cuda_graph_k_list": list(
+                                getattr(
+                                    self.server_args,
+                                    "mtp_static_cuda_graph_k_list",
+                                    [],
+                                )
+                            ),
+                            "pre_captured_decode_q_lens": sorted(
+                                self.mtp_decode_graph_runners.keys()
+                            ),
+                        },
+                    )
         else:
             graph_runner = self._get_graph_runner_for_forward_batch(forward_batch)
             can_run_graph = bool(

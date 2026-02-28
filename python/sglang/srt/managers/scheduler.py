@@ -1994,6 +1994,20 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
+
+        def _release_req_lock_ref_for_requeue(req: Req):
+            # Requests moved back to waiting_queue must not keep a scheduler lock ref;
+            # otherwise repeated defer/requeue cycles leak protected cache accounting.
+            if req.last_node is None:
+                return
+            if self.is_hybrid_swa:
+                if req.swa_uuid_for_lock is None:
+                    return
+                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+                req.swa_uuid_for_lock = None
+            else:
+                self.tree_cache.dec_lock_ref(req.last_node)
+
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked requests has just been released.
@@ -2027,6 +2041,67 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        running_mtp_reqs = [
+            req
+            for req in self.running_batch.reqs
+            if getattr(req.sampling_params, "mtp_enabled", False)
+        ]
+        if self.enable_overlap and running_mtp_reqs:
+            raise ValueError(MTP_OVERLAP_ERROR_MSG)
+        running_non_mtp_reqs = [
+            req
+            for req in self.running_batch.reqs
+            if not getattr(req.sampling_params, "mtp_enabled", False)
+        ]
+        if running_mtp_reqs and running_non_mtp_reqs:
+            raise ValueError(
+                "Running decode batch contains mixed MTP-enabled and non-MTP requests."
+            )
+        running_mtp_bucket = None
+        if running_mtp_reqs:
+            bucket_to_indices = {}
+            for idx, req in enumerate(self.running_batch.reqs):
+                if getattr(req.sampling_params, "mtp_enabled", False):
+                    key = req.mtp_decode_bucket_key()
+                    bucket_to_indices.setdefault(key, []).append(idx)
+
+            if len(bucket_to_indices) > 1:
+                kept_bucket, kept_indices = max(
+                    bucket_to_indices.items(), key=lambda item: len(item[1])
+                )
+                kept_set = set(kept_indices)
+                deferred_indices = sorted(
+                    idx
+                    for indices in bucket_to_indices.values()
+                    for idx in indices
+                    if idx not in kept_set
+                )
+                deferred_reqs = [self.running_batch.reqs[idx] for idx in deferred_indices]
+
+                self.running_batch.filter_batch(keep_indices=sorted(kept_indices))
+                for req in deferred_reqs:
+                    _release_req_lock_ref_for_requeue(req)
+                    self._add_request_to_queue(req)
+                self.running_batch.batch_is_full = False
+                running_bs = len(self.running_batch.reqs)
+
+                logger.warning(
+                    "Deferring running decode requests from mixed adaptive MTP buckets before prefill. "
+                    f"kept_bucket={kept_bucket}, deferred_buckets={set(bucket_to_indices.keys()) - {kept_bucket}}, "
+                    f"deferred_rids={[req.rid for req in deferred_reqs]}"
+                )
+
+            running_mtp_reqs = [
+                req
+                for req in self.running_batch.reqs
+                if getattr(req.sampling_params, "mtp_enabled", False)
+            ]
+            running_mtp_bucket = (
+                running_mtp_reqs[0].mtp_decode_bucket_key() if running_mtp_reqs else None
+            )
+        if self.enable_lora:
+            running_loras = {req.lora_id for req in self.running_batch.reqs}
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2046,36 +2121,6 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
-
-        if self.enable_lora:
-            running_loras = {req.lora_id for req in self.running_batch.reqs}
-        running_mtp_reqs = [
-            req
-            for req in self.running_batch.reqs
-            if getattr(req.sampling_params, "mtp_enabled", False)
-        ]
-        if self.enable_overlap and running_mtp_reqs:
-            raise ValueError(MTP_OVERLAP_ERROR_MSG)
-        running_non_mtp_reqs = [
-            req
-            for req in self.running_batch.reqs
-            if not getattr(req.sampling_params, "mtp_enabled", False)
-        ]
-        if running_mtp_reqs and running_non_mtp_reqs:
-            raise ValueError(
-                "Running decode batch contains mixed MTP-enabled and non-MTP requests."
-            )
-        running_mtp_bucket = None
-        if running_mtp_reqs:
-            running_mtp_bucket_set = {
-                req.mtp_decode_bucket_key() for req in running_mtp_reqs
-            }
-            if len(running_mtp_bucket_set) != 1:
-                raise ValueError(
-                    "Running decode batch has mixed adaptive MTP settings: "
-                    f"{running_mtp_bucket_set=}"
-                )
-            running_mtp_bucket = next(iter(running_mtp_bucket_set))
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -2142,7 +2187,9 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(self.chunked_req is not None),
+                has_chunked_req=(
+                    self.chunked_req is not None or adder.new_chunked_req is not None
+                ),
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -2162,6 +2209,25 @@ class Scheduler(
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+
+        # ReqToTokenPool.alloc currently supports at most one request reusing
+        # an existing req_pool_idx in a prefill batch (chunked continuation).
+        # Under concurrent adaptive scheduling, temporarily defer extra reused
+        # req_pool_idx requests to avoid violating allocator invariants.
+        reused_req_pool = [req for req in can_run_list if req.req_pool_idx is not None]
+        if len(reused_req_pool) > 1:
+            kept = reused_req_pool[0]
+            deferred = [req for req in reused_req_pool[1:]]
+            for req in deferred:
+                _release_req_lock_ref_for_requeue(req)
+            can_run_list = [
+                req for req in can_run_list if req.req_pool_idx is None or req is kept
+            ]
+            logger.warning(
+                "Deferring extra req_pool_idx reusers in prefill batch to keep allocator invariant. "
+                f"kept_rid={kept.rid}, deferred_rids={[r.rid for r in deferred]}"
+            )
+
         if len(can_run_list) == 0:
             return None
 

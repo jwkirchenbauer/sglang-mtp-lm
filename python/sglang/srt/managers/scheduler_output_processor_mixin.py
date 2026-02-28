@@ -706,6 +706,16 @@ class SchedulerOutputProcessorMixin:
                         "phase_after_step": req.mtp_phase,
                     },
                 )
+                if envs.SGLANG_MTP_KV_LEAK_DEBUG.get():
+                    req.mtp_debug_last_step_idx = int(processed_step_idx)
+                    req.mtp_debug_last_phase = str(batch.mtp_phase)
+                    req.mtp_debug_last_req_q_len = int(req_q_len)
+                    req.mtp_debug_last_commit_len = int(req.mtp_commit_len)
+                    req.mtp_debug_last_curr_step_cache_loc = (
+                        curr_step_cache_loc.detach().clone()
+                        if curr_step_cache_loc is not None
+                        else None
+                    )
 
             req.check_finished(new_accepted_len)
 
@@ -713,16 +723,38 @@ class SchedulerOutputProcessorMixin:
                 if is_mtp_req:
                     req.mtp_pending_tokens = []
                     req.clear_mtp_overlap_provisional()
-                    if req.mtp_overlap_prev_step_cache_loc is not None:
-                        self.token_to_kv_pool_allocator.free(req.mtp_overlap_prev_step_cache_loc)
-                        req.kv_allocated_len -= int(req.mtp_overlap_prev_step_cache_loc.numel())
-                        req.mtp_overlap_prev_step_cache_loc = None
-                if is_mtp_req and req.mtp_prev_step_cache_loc is not None:
-                    self.token_to_kv_pool_allocator.free(req.mtp_prev_step_cache_loc)
-                    req.kv_allocated_len -= int(req.mtp_prev_step_cache_loc.numel())
-                    req.mtp_prev_step_cache_loc = None
+                    # Keep finish-path MTP tail cleanup centralized in release_kv_cache().
+                    # Manual frees here can race with adaptive q-len state transitions and
+                    # skew req.kv_allocated_len by exactly (k-1) on terminal steps.
+                    max_committable_kv_len = len(req.origin_input_ids) + len(req.output_ids)
+                    if req.kv_committed_len > max_committable_kv_len:
+                        logger.warning(
+                            "Clamping MTP committed KV length to emitted token length "
+                            "before release. "
+                            f"rid={req.rid}, req_q_len={req_q_len}, "
+                            f"decode_k_this_step={decode_k_this_step}, "
+                            f"kv_committed_len={req.kv_committed_len}, "
+                            f"max_committable_kv_len={max_committable_kv_len}, "
+                            f"output_ids_len={len(req.output_ids)}"
+                        )
+                        req.kv_committed_len = max_committable_kv_len
                 if is_mtp_req:
-                    req.kv_committed_len = req.kv_allocated_len
+                    # Keep the true committed length. Any decode-step over-allocation
+                    # must remain in [kv_committed_len, kv_allocated_len) so that
+                    # release_kv_cache() can free it explicitly via pop_overallocated_kv_cache().
+                    if req.kv_committed_len > req.kv_allocated_len:
+                        logger.warning(
+                            "Clamping invalid KV lengths before MTP release. "
+                            f"rid={req.rid}, req_q_len={req_q_len}, "
+                            f"decode_k_this_step={decode_k_this_step}, "
+                            f"kv_committed_len={req.kv_committed_len}, "
+                            f"kv_allocated_len={req.kv_allocated_len}, "
+                            f"mtp_prev_tail="
+                            f"{0 if req.mtp_prev_step_cache_loc is None else int(req.mtp_prev_step_cache_loc.numel())}, "
+                            f"mtp_overlap_prev_tail="
+                            f"{0 if req.mtp_overlap_prev_step_cache_loc is None else int(req.mtp_overlap_prev_step_cache_loc.numel())}"
+                        )
+                        req.kv_committed_len = req.kv_allocated_len
 
                 self.maybe_collect_routed_experts(req)
 

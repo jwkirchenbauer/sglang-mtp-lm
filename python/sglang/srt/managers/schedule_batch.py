@@ -108,6 +108,7 @@ MTP_OVERLAP_ERROR_MSG = (
     "Temporary phase-2A policy: MTP decode currently requires "
     "--disable-overlap-schedule while static/conf_adapt CUDA graph stability is being finalized."
 )
+MTP_SEED_ANCHOR_SKIP_FREE_LOG_INTERVAL_SEC = 5.0
 
 
 @lru_cache(maxsize=1)
@@ -585,6 +586,12 @@ class Req(ReqDllmMixin):
         self.mtp_overlap_prev_step_cache_loc: Optional[torch.Tensor] = None
         self.mtp_seed_anchor_adjusted: bool = False
         self.mtp_seed_anchor_old_last_loc: Optional[int] = None
+        self.mtp_seed_anchor_old_last_pos: Optional[int] = None
+        self.mtp_debug_last_step_idx: int = -1
+        self.mtp_debug_last_phase: str = ""
+        self.mtp_debug_last_req_q_len: int = 0
+        self.mtp_debug_last_commit_len: int = 0
+        self.mtp_debug_last_curr_step_cache_loc: Optional[torch.Tensor] = None
         self.mtp_debug_trace_enabled: bool = False
         self.mtp_debug_max_steps: int = 4
         self.mtp_debug_trace: List[Dict[str, Any]] = []
@@ -1051,6 +1058,32 @@ class Req(ReqDllmMixin):
         return self.finished_reason is not None
 
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
+        if tree_cache is not None:
+            # Requests deferred from running decode back to waiting/prefill may carry
+            # stale MTP tail cache refs (e.g., seed tail of size k-1). These tails are
+            # provisional and must not survive across re-queue/extend transitions.
+            if self.mtp_prev_step_cache_loc is not None:
+                tree_cache.token_to_kv_pool_allocator.free(self.mtp_prev_step_cache_loc)
+                self.kv_allocated_len -= int(self.mtp_prev_step_cache_loc.numel())
+                self.mtp_prev_step_cache_loc = None
+            if self.mtp_overlap_prev_step_cache_loc is not None:
+                tree_cache.token_to_kv_pool_allocator.free(
+                    self.mtp_overlap_prev_step_cache_loc
+                )
+                self.kv_allocated_len -= int(
+                    self.mtp_overlap_prev_step_cache_loc.numel()
+                )
+                self.mtp_overlap_prev_step_cache_loc = None
+            if self.kv_allocated_len < self.kv_committed_len:
+                # Re-queue path will recompute kv lengths in prepare_for_extend.
+                # Clamp here to keep request-local accounting coherent.
+                logger.warning(
+                    "Clamping KV lengths while draining stale MTP tails before re-queue. "
+                    f"rid={self.rid}, kv_committed_len={self.kv_committed_len}, "
+                    f"kv_allocated_len={self.kv_allocated_len}"
+                )
+                self.kv_committed_len = self.kv_allocated_len
+
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
@@ -1314,6 +1347,12 @@ class Req(ReqDllmMixin):
         self.mtp_overlap_prev_step_cache_loc = None
         self.mtp_seed_anchor_adjusted = False
         self.mtp_seed_anchor_old_last_loc = None
+        self.mtp_seed_anchor_old_last_pos = None
+        self.mtp_debug_last_step_idx = -1
+        self.mtp_debug_last_phase = ""
+        self.mtp_debug_last_req_q_len = 0
+        self.mtp_debug_last_commit_len = 0
+        self.mtp_debug_last_curr_step_cache_loc = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1494,6 +1533,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Device
     device: str = "cuda"
+    _mtp_seed_anchor_skip_free_log_ts: float = 0.0
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
@@ -2206,9 +2246,55 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             req.req_pool_idx, old_last_pos
                         ].item()
                     )
-                    self.token_to_kv_pool_allocator.free(
-                        torch.tensor([old_last_loc], dtype=torch.int64, device=self.device)
-                    )
+                    anchor_is_cache_protected = old_last_pos < req.cache_protected_len
+                    if not anchor_is_cache_protected:
+                        self.token_to_kv_pool_allocator.free(
+                            torch.tensor(
+                                [old_last_loc], dtype=torch.int64, device=self.device
+                            )
+                        )
+                    else:
+                        # The seed anchor is part of cache-protected prefix ownership.
+                        # Rebase request-local prefix state to exclude this anchor so
+                        # the recomputed token is treated as newly allocated (not cached).
+                        # This avoids free∩cached overlap and one-token orphan drift.
+                        old_cache_protected_len = req.cache_protected_len
+                        seed_base_token_ids = (req.origin_input_ids + req.output_ids)[
+                            :old_last_pos
+                        ]
+                        seed_base_match = self.tree_cache.match_prefix(
+                            MatchPrefixParams(
+                                key=RadixKey(seed_base_token_ids, req.extra_key)
+                            )
+                        )
+                        new_last_node = seed_base_match.last_device_node
+                        if req.last_node != new_last_node:
+                            self.tree_cache.dec_lock_ref(req.last_node)
+                            self.tree_cache.inc_lock_ref(new_last_node)
+                            req.last_node = new_last_node
+                        req.prefix_indices = seed_base_match.device_indices
+                        # Keep cache_protected_len bounded by logical decode base.
+                        req.cache_protected_len = min(
+                            len(req.prefix_indices), old_last_pos
+                        )
+
+                        now = time.perf_counter()
+                        last_log_ts = getattr(
+                            self, "_mtp_seed_anchor_skip_free_log_ts", 0.0
+                        )
+                        if (
+                            now - last_log_ts
+                            >= MTP_SEED_ANCHOR_SKIP_FREE_LOG_INTERVAL_SEC
+                        ):
+                            logger.info(
+                                "Skipping MTP seed-anchor allocator free for cache-protected token. "
+                                f"rid={req.rid}, old_last_pos={old_last_pos}, "
+                                f"cache_protected_len_before={old_cache_protected_len}, "
+                                f"cache_protected_len_after={req.cache_protected_len}, "
+                                f"old_last_loc={old_last_loc}, "
+                                f"anchor_is_cache_protected={anchor_is_cache_protected}"
+                            )
+                            self._mtp_seed_anchor_skip_free_log_ts = now
                     req.kv_committed_len -= 1
                     req.kv_allocated_len -= 1
                     if req.kv_allocated_len < req.kv_committed_len:
@@ -2218,6 +2304,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         )
                     req.mtp_seed_anchor_adjusted = True
                     req.mtp_seed_anchor_old_last_loc = old_last_loc
+                    req.mtp_seed_anchor_old_last_pos = old_last_pos
 
         if not self.model_config.is_encoder_decoder:
             if mtp_enabled_reqs:
@@ -2591,7 +2678,60 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
-            self.output_ids = torch.cat([self.output_ids, other.output_ids])
+            if other.output_ids is None:
+                raise ValueError(
+                    "Merging batches with inconsistent output_ids state: "
+                    "self.output_ids is set but other.output_ids is None."
+                )
+
+            lhs_output_ids = self.output_ids
+            rhs_output_ids = other.output_ids
+            if not isinstance(lhs_output_ids, torch.Tensor):
+                lhs_output_ids = torch.tensor(
+                    lhs_output_ids, dtype=torch.int64, device=self.device
+                )
+            if not isinstance(rhs_output_ids, torch.Tensor):
+                rhs_output_ids = torch.tensor(
+                    rhs_output_ids, dtype=torch.int64, device=self.device
+                )
+
+            # Adaptive MTP can transiently create mixed [B] and [B, q] output rows
+            # when merging decode and extend batches. In this case, only the latest
+            # token per request is needed for the next decode step.
+            if (
+                isinstance(lhs_output_ids, torch.Tensor)
+                and isinstance(rhs_output_ids, torch.Tensor)
+                and (
+                    lhs_output_ids.ndim != rhs_output_ids.ndim
+                    or (
+                        lhs_output_ids.ndim > 1
+                        and lhs_output_ids.shape[1:] != rhs_output_ids.shape[1:]
+                    )
+                )
+            ):
+                has_mtp = any(
+                    getattr(req.sampling_params, "mtp_enabled", False)
+                    for req in chain(self.reqs, other.reqs)
+                )
+                if has_mtp:
+                    lhs_shape = tuple(lhs_output_ids.shape)
+                    rhs_shape = tuple(rhs_output_ids.shape)
+                    if lhs_output_ids.ndim > 1:
+                        lhs_output_ids = lhs_output_ids[..., -1]
+                    if rhs_output_ids.ndim > 1:
+                        rhs_output_ids = rhs_output_ids[..., -1]
+                    logger.info(
+                        "Normalizing mismatched output_ids shapes for MTP batch merge. "
+                        f"lhs_shape={lhs_shape}, rhs_shape={rhs_shape}, "
+                        f"normalized_shape={tuple(lhs_output_ids.shape)}"
+                    )
+                else:
+                    raise ValueError(
+                        "Merging batches with incompatible output_ids shapes: "
+                        f"lhs={tuple(lhs_output_ids.shape)}, rhs={tuple(rhs_output_ids.shape)}"
+                    )
+
+            self.output_ids = torch.cat([lhs_output_ids, rhs_output_ids])
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None

@@ -445,6 +445,12 @@ class PrefillAdder:
             * self.new_token_ratio
         )
 
+    def _has_chunked_req_in_batch(self) -> bool:
+        if self.new_chunked_req is not None:
+            return True
+        # Reused req_pool_idx means the request is a continuing chunked prefill.
+        return any(r.req_pool_idx is not None for r in self.can_run_list)
+
     @property
     def rem_total_tokens(self):
         if self.is_hybrid_swa:
@@ -704,6 +710,8 @@ class PrefillAdder:
         else:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
+            if self._has_chunked_req_in_batch():
+                return AddReqResult.OTHER
 
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
@@ -797,6 +805,10 @@ class PrefillAdder:
                     ),
                 )
             else:
+                if has_chunked_req or self._has_chunked_req_in_batch():
+                    # At most one chunked request may be active in a prefill batch.
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 

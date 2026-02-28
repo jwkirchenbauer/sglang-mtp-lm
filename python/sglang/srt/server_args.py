@@ -581,6 +581,8 @@ class ServerArgs:
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_mtp_static_q_len_cuda_graph: bool = False
+    mtp_static_cuda_graph_k_list: Optional[List[int]] = None
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -2883,6 +2885,33 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
+        if self.mtp_static_cuda_graph_k_list is None:
+            self.mtp_static_cuda_graph_k_list = []
+        else:
+            normalized_k_list = sorted({int(k) for k in self.mtp_static_cuda_graph_k_list})
+            if any(k <= 0 for k in normalized_k_list):
+                raise ValueError(
+                    "mtp_static_cuda_graph_k_list must contain positive integers only."
+                )
+            self.mtp_static_cuda_graph_k_list = normalized_k_list
+
+        if (
+            self.enable_mtp_static_q_len_cuda_graph
+            and len(self.mtp_static_cuda_graph_k_list) == 0
+        ):
+            logger.warning(
+                "enable_mtp_static_q_len_cuda_graph is set but mtp_static_cuda_graph_k_list is empty. "
+                "q_len>1 decode will stay eager."
+            )
+        if (
+            not self.enable_mtp_static_q_len_cuda_graph
+            and len(self.mtp_static_cuda_graph_k_list) > 0
+        ):
+            logger.warning(
+                "mtp_static_cuda_graph_k_list is set but enable_mtp_static_q_len_cuda_graph is false. "
+                "Ignoring static q_len>1 cuda graph pre-capture."
+            )
+
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
@@ -4497,6 +4526,18 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--enable-mtp-static-q-len-cuda-graph",
+            action="store_true",
+            help="Experimental: enable q_len>1 CUDA graph replay for static MTP decode (seed+steady), using only pre-captured q-lens.",
+        )
+        parser.add_argument(
+            "--mtp-static-cuda-graph-k-list",
+            type=int,
+            nargs="+",
+            default=ServerArgs.mtp_static_cuda_graph_k_list,
+            help="Experimental: explicit static MTP k values for q_len>1 pre-capture. Captures seed q=k and steady q=2k-1 for each k.",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",
