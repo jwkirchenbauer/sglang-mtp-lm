@@ -22,7 +22,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -182,6 +182,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
@@ -746,6 +747,16 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
+        # Adaptive decode-only pause queue keyed by MTP decode bucket.
+        # Requests parked here are resumed directly into decode and must not
+        # re-enter waiting/prefill lifecycle.
+        self.mtp_decode_pause_queue: Dict[
+            Tuple[bool, str, int, int, Optional[str], str, Optional[float]],
+            Deque[Req],
+        ] = {}
+        self.mtp_decode_pause_bucket_birth_ts: Dict[
+            Tuple[bool, str, int, int, Optional[str], str, Optional[float]], float
+        ] = {}
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -759,6 +770,194 @@ class Scheduler(
         self.sessions: Dict[str, Session] = {}
         self.forward_sleep_time = None
         self._engine_paused = False
+
+    def _paused_mtp_req_count(self) -> int:
+        return int(sum(len(reqs) for reqs in self.mtp_decode_pause_queue.values()))
+
+    def _iter_paused_mtp_reqs(self) -> List[Req]:
+        return [req for queue in self.mtp_decode_pause_queue.values() for req in queue]
+
+    def _remove_paused_mtp_reqs(self, predicate: Callable[[Req], bool]) -> List[Req]:
+        removed: List[Req] = []
+        for bucket in list(self.mtp_decode_pause_queue.keys()):
+            queue = self.mtp_decode_pause_queue[bucket]
+            kept: Deque[Req] = deque()
+            while queue:
+                req = queue.popleft()
+                if predicate(req):
+                    removed.append(req)
+                else:
+                    kept.append(req)
+            if kept:
+                self.mtp_decode_pause_queue[bucket] = kept
+            else:
+                del self.mtp_decode_pause_queue[bucket]
+                self.mtp_decode_pause_bucket_birth_ts.pop(bucket, None)
+        return removed
+
+    def _validate_mtp_prefill_queue_admission(
+        self, req: Req, *, caller_reason: str
+    ) -> None:
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            return
+        if not getattr(req.sampling_params, "mtp_enabled", False):
+            return
+        if getattr(req, "mtp_strategy_kind", None) != "conf_adapt":
+            return
+        phase_for_step = req.mtp_phase_for_step()
+        if phase_for_step != "steady":
+            return
+        pending_len = len(req.mtp_pending_tokens_for_step())
+        has_prev_tail_ref = bool(
+            req.mtp_prev_step_cache_loc is not None
+            or req.mtp_overlap_prev_step_cache_loc is not None
+        )
+        has_unresolved_decode_state = bool(
+            pending_len > 0 or has_prev_tail_ref or req.kv_allocated_len > req.kv_committed_len
+        )
+        if not has_unresolved_decode_state:
+            return
+        raise ValueError(
+            "Illegal adaptive MTP queue admission: steady decode request was sent "
+            "to waiting/prefill queue. "
+            f"rid={req.rid}, caller_reason={caller_reason}, phase={phase_for_step}, "
+            f"pending_len={pending_len}, "
+            f"bucket={req.mtp_decode_bucket_key()}, "
+            f"has_prev_tail_ref={has_prev_tail_ref}, "
+            f"kv_committed_len={req.kv_committed_len}, "
+            f"kv_allocated_len={req.kv_allocated_len}."
+        )
+
+    def _pause_mtp_decode_reqs(self, reqs: List[Req], *, reason: str) -> None:
+        if not reqs:
+            return
+        ts = time.perf_counter()
+        for req in reqs:
+            bucket = req.mtp_decode_bucket_key()
+            if bucket not in self.mtp_decode_pause_queue:
+                self.mtp_decode_pause_queue[bucket] = deque()
+                self.mtp_decode_pause_bucket_birth_ts[bucket] = ts
+            self.mtp_decode_pause_queue[bucket].append(req)
+            req.time_stats.wait_queue_entry_time = ts
+            self.num_paused_reqs += 1
+            self._log_mtp_transition_tuple(
+                req,
+                "before_pause_decode_bucket_defer",
+                lifecycle_source="pause_resume",
+            )
+
+        logger.warning(
+            "Paused adaptive decode requests for decode-only resume. "
+            f"reason={reason}, paused_rids={[req.rid for req in reqs]}, "
+            f"paused_total={self._paused_mtp_req_count()}"
+        )
+
+    def _select_mtp_pause_bucket(
+        self,
+        preferred_bucket: Optional[
+            Tuple[bool, str, int, int, Optional[str], str, Optional[float]]
+        ] = None,
+    ) -> Optional[Tuple[bool, str, int, int, Optional[str], str, Optional[float]]]:
+        if preferred_bucket is not None:
+            queue = self.mtp_decode_pause_queue.get(preferred_bucket)
+            if queue is not None and len(queue) > 0:
+                return preferred_bucket
+
+        candidates = []
+        for bucket, queue in self.mtp_decode_pause_queue.items():
+            if not queue:
+                continue
+            candidates.append(
+                (
+                    -len(queue),
+                    float(self.mtp_decode_pause_bucket_birth_ts.get(bucket, float("inf"))),
+                    str(bucket),
+                    bucket,
+                )
+            )
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][3]
+
+    def _promote_paused_mtp_bucket_into_running(self) -> int:
+        if not self.mtp_decode_pause_queue:
+            return 0
+        # Correctness-first: only resume paused adaptive decode requests when the
+        # running batch is empty. This avoids merging unprepared batch tensors.
+        if not self.running_batch.is_empty():
+            return 0
+
+        running_active = [
+            req
+            for req in self.running_batch.reqs
+            if not req.finished() and not req.is_retracted
+        ]
+        running_mtp = [
+            req
+            for req in running_active
+            if getattr(req.sampling_params, "mtp_enabled", False)
+        ]
+        running_non_mtp = [
+            req
+            for req in running_active
+            if not getattr(req.sampling_params, "mtp_enabled", False)
+        ]
+        if running_mtp and running_non_mtp:
+            raise ValueError(
+                "Running decode batch contains mixed MTP-enabled and non-MTP requests."
+            )
+        if running_non_mtp:
+            return 0
+
+        preferred_bucket = None
+        if running_mtp:
+            running_buckets = {req.mtp_decode_bucket_key() for req in running_mtp}
+            if len(running_buckets) != 1:
+                return 0
+            preferred_bucket = next(iter(running_buckets))
+
+        bucket = self._select_mtp_pause_bucket(preferred_bucket)
+        if bucket is None:
+            return 0
+
+        promoted = list(self.mtp_decode_pause_queue.pop(bucket))
+        self.mtp_decode_pause_bucket_birth_ts.pop(bucket, None)
+        if not promoted:
+            return 0
+
+        resumed_batch = ScheduleBatch.init_new(
+            reqs=promoted,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+            dllm_config=self.dllm_config,
+        )
+        # This batch is decode-resume only; mark mode explicitly so decode
+        # scheduling logic can treat it as a decode batch before tensor prep.
+        resumed_batch.forward_mode = ForwardMode.DECODE
+        resumed_batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            resumed_batch, self.model_config.vocab_size
+        )
+        resumed_batch.req_pool_indices = torch.tensor(
+            [int(req.req_pool_idx) for req in promoted],
+            dtype=torch.int32,
+            device=self.req_to_token_pool.device,
+        )
+        self.running_batch = resumed_batch
+        self.running_batch.batch_is_full = False
+
+        for req in promoted:
+            self._log_mtp_transition_tuple(
+                req,
+                "after_pause_queue_promote",
+                lifecycle_source="pause_resume",
+            )
+
+        return len(promoted)
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -1677,7 +1876,10 @@ class Scheduler(
                     prefix_keys,
                 )
 
-    def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+    def _add_request_to_queue(
+        self, req: Req, is_retracted: bool = False, caller_reason: str = "unspecified"
+    ):
+        self._validate_mtp_prefill_queue_admission(req, caller_reason=caller_reason)
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -1699,6 +1901,19 @@ class Scheduler(
                 req.time_stats.decode_prealloc_queue_entry_time = time.perf_counter()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _log_mtp_transition_tuple(
+        self, req: Req, event: str, *, lifecycle_source: str = "decode"
+    ) -> None:
+        if not envs.SGLANG_MTP_KV_LEAK_DEBUG.get():
+            return
+        if not getattr(req.sampling_params, "mtp_enabled", False):
+            return
+        logger.info(
+            f"MTP transition tuple ({event}). "
+            f"tuple={req.mtp_transition_debug_tuple()}, "
+            f"lifecycle_source={lifecycle_source}"
+        )
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -1728,7 +1943,8 @@ class Scheduler(
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
         if (
             self.max_queued_requests is None
-            or len(self.waiting_queue) + 1 <= self.max_queued_requests
+            or len(self.waiting_queue) + self._paused_mtp_req_count() + 1
+            <= self.max_queued_requests
         ):
             return False
 
@@ -1801,6 +2017,26 @@ class Scheduler(
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
             ]
+
+        paused_timeouts = self._remove_paused_mtp_reqs(
+            lambda req: 0 < req.time_stats.wait_queue_entry_time < deadline
+        )
+        for req in paused_timeouts:
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            self.send_to_tokenizer.send_output(
+                AbortReq(
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "Request waiting timeout reached.",
+                    },
+                    rid=req.rid,
+                ),
+                req,
+            )
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            logger.debug(f"Abort paused decode request on waiting timeout. {req.rid=}")
 
     def handle_embedding_request(
         self,
@@ -1919,6 +2155,14 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        promoted_count = self._promote_paused_mtp_bucket_into_running()
+        if promoted_count > 0:
+            logger.info(
+                "Promoted paused adaptive decode requests into running batch. "
+                f"promoted_count={promoted_count}, "
+                f"remaining_paused={self._paused_mtp_req_count()}"
+            )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
@@ -1984,6 +2228,15 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        # `get_new_batch_prefill` is called before `update_running_batch`.
+        # Prune finished entries here so MTP bucket checks never inspect stale
+        # steady-phase requests with empty pending state.
+        if not self.running_batch.is_empty():
+            old_bs = self.running_batch.batch_size()
+            self.running_batch.filter_batch(v1_spec_info_filtered=True)
+            if self.running_batch.batch_size() < old_bs:
+                self.running_batch.batch_is_full = False
+
         if self.try_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
@@ -2045,6 +2298,8 @@ class Scheduler(
             req
             for req in self.running_batch.reqs
             if getattr(req.sampling_params, "mtp_enabled", False)
+            and not req.finished()
+            and not req.is_retracted
         ]
         if self.enable_overlap and running_mtp_reqs:
             raise ValueError(MTP_OVERLAP_ERROR_MSG)
@@ -2052,6 +2307,8 @@ class Scheduler(
             req
             for req in self.running_batch.reqs
             if not getattr(req.sampling_params, "mtp_enabled", False)
+            and not req.finished()
+            and not req.is_retracted
         ]
         if running_mtp_reqs and running_non_mtp_reqs:
             raise ValueError(
@@ -2061,7 +2318,11 @@ class Scheduler(
         if running_mtp_reqs:
             bucket_to_indices = {}
             for idx, req in enumerate(self.running_batch.reqs):
-                if getattr(req.sampling_params, "mtp_enabled", False):
+                if (
+                    getattr(req.sampling_params, "mtp_enabled", False)
+                    and not req.finished()
+                    and not req.is_retracted
+                ):
                     key = req.mtp_decode_bucket_key()
                     bucket_to_indices.setdefault(key, []).append(idx)
 
@@ -2081,7 +2342,9 @@ class Scheduler(
                 self.running_batch.filter_batch(keep_indices=sorted(kept_indices))
                 for req in deferred_reqs:
                     _release_req_lock_ref_for_requeue(req)
-                    self._add_request_to_queue(req)
+                self._pause_mtp_decode_reqs(
+                    deferred_reqs, reason="mixed_bucket_defer_prefill"
+                )
                 self.running_batch.batch_is_full = False
                 running_bs = len(self.running_batch.reqs)
 
@@ -2095,6 +2358,8 @@ class Scheduler(
                 req
                 for req in self.running_batch.reqs
                 if getattr(req.sampling_params, "mtp_enabled", False)
+                and not req.finished()
+                and not req.is_retracted
             ]
             running_mtp_bucket = (
                 running_mtp_reqs[0].mtp_decode_bucket_key() if running_mtp_reqs else None
@@ -2185,6 +2450,9 @@ class Scheduler(
                 )
 
             req.init_next_round_input(self.tree_cache)
+            self._log_mtp_transition_tuple(
+                req, "after_init_next_round_input", lifecycle_source="prefill"
+            )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(
@@ -2325,6 +2593,17 @@ class Scheduler(
         ):
             raise ValueError(MTP_OVERLAP_ERROR_MSG)
 
+        def _release_req_lock_ref_for_requeue(req: Req):
+            if req.last_node is None:
+                return
+            if self.is_hybrid_swa:
+                if req.swa_uuid_for_lock is None:
+                    return
+                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+                req.swa_uuid_for_lock = None
+            else:
+                self.tree_cache.dec_lock_ref(req.last_node)
+
         # Adaptive MTP can diverge into multiple decode-shape buckets after each
         # step. Keep a homogeneous bucket in the running batch and defer other
         # buckets to later scheduling rounds.
@@ -2355,7 +2634,10 @@ class Scheduler(
 
                     batch.filter_batch(keep_indices=sorted(keep_indices))
                     for req in deferred_reqs:
-                        self._add_request_to_queue(req)
+                        _release_req_lock_ref_for_requeue(req)
+                    self._pause_mtp_decode_reqs(
+                        deferred_reqs, reason="mixed_bucket_defer_decode"
+                    )
 
                     batch.batch_is_full = False
                     if batch.is_empty():
@@ -2446,9 +2728,9 @@ class Scheduler(
             batch_result.logits_output, "mtp_effective_k_per_req", None
         )
         if effective_k is None:
-            if batch.mtp_decode_k_per_req is None:
+            if batch.mtp_attempt_k_per_req is None:
                 return None
-            return [max(1, int(x)) for x in batch.mtp_decode_k_per_req]
+            return [max(1, int(x)) for x in batch.mtp_attempt_k_per_req]
 
         if isinstance(effective_k, torch.Tensor):
             effective_k_list = effective_k.detach().to("cpu").tolist()
@@ -2461,11 +2743,7 @@ class Scheduler(
                 f"effective_k={len(effective_k_list)}, batch_size={len(batch.reqs)}."
             )
 
-        max_decode_k = (
-            [int(x) for x in batch.mtp_decode_k_per_req]
-            if batch.mtp_decode_k_per_req is not None
-            else [int(req.sampling_params.mtp_k) for req in batch.reqs]
-        )
+        max_decode_k = [int(req.sampling_params.mtp_k) for req in batch.reqs]
 
         return [
             max(1, min(int(effective_k_list[i]), max_decode_k[i]))
@@ -2478,6 +2756,8 @@ class Scheduler(
         batch_result: GenerationBatchResult,
         future_indices: FutureIndices,
     ) -> None:
+        if not self.enable_overlap:
+            return
         if (
             batch is None
             or batch_result is None
@@ -2523,15 +2803,35 @@ class Scheduler(
             req.mtp_overlap_next_phase = (
                 "steady" if phase_for_batch == "seed" else phase_for_batch
             )
-            req.mtp_overlap_commit_len = 1 if phase_for_batch == "seed" else effective_k
+            commit_len = (
+                int(batch.mtp_commit_len_per_req[i])
+                if batch.mtp_commit_len_per_req is not None
+                and i < len(batch.mtp_commit_len_per_req)
+                else (1 if phase_for_batch == "seed" else effective_k)
+            )
+            commit_start = (
+                int(batch.mtp_commit_start_per_req[i])
+                if batch.mtp_commit_start_per_req is not None
+                and i < len(batch.mtp_commit_start_per_req)
+                else 0
+            )
+            req.mtp_overlap_commit_len = commit_len
             req.mtp_overlap_pending_step_idx = int(step_idxs[i])
             req_q_len = int(batch.decode_q_len_per_req)
             start = i * req_q_len
             curr_step_cache_loc = batch.out_cache_loc[start : start + req_q_len]
-            if req_q_len > req.mtp_overlap_commit_len:
-                req.mtp_overlap_prev_step_cache_loc = curr_step_cache_loc[
-                    req.mtp_overlap_commit_len :
-                ].clone()
+            commit_end = commit_start + commit_len
+            tail_parts = []
+            if commit_start > 0:
+                tail_parts.append(curr_step_cache_loc[:commit_start])
+            if commit_end < req_q_len:
+                tail_parts.append(curr_step_cache_loc[commit_end:])
+            if tail_parts:
+                req.mtp_overlap_prev_step_cache_loc = (
+                    torch.cat(tail_parts).clone()
+                    if len(tail_parts) > 1
+                    else tail_parts[0].clone()
+                )
 
     def run_batch(
         self,
@@ -2789,6 +3089,8 @@ class Scheduler(
             return False
         if len(self.waiting_queue) != 0:
             return False
+        if self._paused_mtp_req_count() != 0:
+            return False
         if len(self.grammar_manager.grammar_queue) != 0:
             return False
         return True
@@ -2807,6 +3109,7 @@ class Scheduler(
                 message=(
                     "Reject attach: scheduler is not idle. "
                     f"#queue-req={len(self.waiting_queue)} "
+                    f"#paused-req={self._paused_mtp_req_count()} "
                     f"#running-req={len(self.running_batch.reqs)}"
                 ),
             )
@@ -2860,6 +3163,7 @@ class Scheduler(
                 message=(
                     "Reject detach: scheduler is not idle. "
                     f"#queue-req={len(self.waiting_queue)} "
+                    f"#paused-req={self._paused_mtp_req_count()} "
                     f"#running-req={len(self.running_batch.reqs)}"
                 ),
             )
@@ -2897,6 +3201,7 @@ class Scheduler(
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
+            and self._paused_mtp_req_count() == 0
         )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             no_request &= (
@@ -2932,6 +3237,7 @@ class Scheduler(
             logging.warning(
                 f"Cache not flushed because there are pending requests. "
                 f"#queue-req: {len(self.waiting_queue)}, "
+                f"#paused-req: {self._paused_mtp_req_count()}, "
                 f"#running-req: {len(self.running_batch.reqs)}"
             )
             success = False
@@ -3058,6 +3364,16 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        paused_reqs = self._remove_paused_mtp_reqs(
+            lambda req: recv_req.abort_all or req.rid.startswith(recv_req.rid)
+        )
+        for req in paused_reqs:
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+            logger.debug(f"Abort paused decode request. {req.rid=}")
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`

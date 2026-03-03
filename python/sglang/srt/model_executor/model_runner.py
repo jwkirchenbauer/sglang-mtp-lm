@@ -2386,7 +2386,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if phase not in {"seed", "steady"}:
             return False, f"phase_{phase}"
         strategy_kind = getattr(forward_batch, "mtp_strategy_kind", None)
-        if strategy_kind is not None:
+        if strategy_kind is None:
+            pass
+        elif strategy_kind == "conf_adapt":
+            mode = getattr(forward_batch, "mtp_adaptive_window_mode", "hf_exact")
+            if mode != "fixed_window":
+                return False, f"adaptive_mode_{mode}"
+        else:
             return False, f"strategy_{strategy_kind}"
         decode_q_len = int(getattr(forward_batch, "decode_q_len_per_req", 1))
         if decode_q_len not in self.mtp_decode_graph_runners:
@@ -2826,7 +2832,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         sample_debug[i] = {
                             "step_idx": int(step_idxs[i]),
                             "phase": forward_batch.mtp_phase,
+                            "adaptive_window_mode": getattr(
+                                forward_batch, "mtp_adaptive_window_mode", None
+                            ),
                             "decode_q_len_per_req": 1,
+                            "attempt_k": 1,
+                            "recompute_len": 1,
+                            "commit_start": 0,
+                            "commit_len": 1,
                             "effective_k": 1,
                             "argmax_row_token_ids": _cap_row(token_ids[i]),
                             "pending_token_ids": _cap_row(token_ids[i]),
@@ -2852,6 +2865,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 emit_start = forward_batch.mtp_emit_start_per_req
                 emit_len = forward_batch.mtp_emit_len_per_req
                 emit_end = emit_start + emit_len
+                commit_start_per_req = getattr(
+                    forward_batch, "mtp_commit_start_per_req", None
+                )
+                commit_len_per_req = getattr(
+                    forward_batch, "mtp_commit_len_per_req", None
+                )
+                recompute_len_per_req = getattr(
+                    forward_batch, "mtp_recompute_len_per_req", None
+                )
+                attempt_k_per_req = getattr(
+                    forward_batch, "mtp_attempt_k_per_req", None
+                )
 
                 if emit_start < 0 or emit_start >= q_len or emit_end > q_len:
                     raise ValueError(
@@ -2906,14 +2931,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 chosen_len = 1
                         effective_k[i] = chosen_len
 
-                if forward_batch.mtp_phase == "steady":
-                    logits_output.mtp_committed_token_ids = token_ids[
-                        :, : emit_start + 1
-                    ].to(torch.int32)
-                else:
-                    logits_output.mtp_committed_token_ids = torch.empty(
-                        (bs, 0), dtype=torch.int32, device=token_ids.device
+                if commit_start_per_req is None:
+                    commit_start_per_req = [0] * bs
+                if commit_len_per_req is None:
+                    if forward_batch.mtp_phase == "seed":
+                        commit_len_per_req = [1] * bs
+                    else:
+                        commit_len_per_req = [emit_start + 1] * bs
+                if len(commit_start_per_req) != bs or len(commit_len_per_req) != bs:
+                    raise ValueError(
+                        "MTP commit metadata length mismatch in model runner decode path. "
+                        f"batch_size={bs}, commit_start_len={len(commit_start_per_req)}, "
+                        f"commit_len_len={len(commit_len_per_req)}."
                     )
+
+                max_commit_len = max(int(x) for x in commit_len_per_req) if bs > 0 else 0
+                committed_rows = torch.zeros(
+                    (bs, max_commit_len), dtype=torch.int32, device=token_ids.device
+                )
+                for i in range(bs):
+                    commit_start = int(commit_start_per_req[i])
+                    commit_len = int(commit_len_per_req[i])
+                    commit_end = commit_start + commit_len
+                    if (
+                        commit_start < 0
+                        or commit_len < 1
+                        or commit_end > q_len
+                    ):
+                        raise ValueError(
+                            "Invalid MTP commit slice in model runner decode path. "
+                            f"row={i}, commit_start={commit_start}, commit_len={commit_len}, q_len={q_len}."
+                        )
+                    committed_rows[i, :commit_len] = token_ids[
+                        i, commit_start:commit_end
+                    ].to(torch.int32)
+                logits_output.mtp_committed_token_ids = committed_rows
                 logits_output.mtp_pending_token_ids = pending_ids
                 if strategy_kind == "conf_adapt":
                     logits_output.mtp_effective_k_per_req = effective_k
@@ -2930,12 +2982,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         if not forward_batch.mtp_debug_trace_enabled_per_req[i]:
                             continue
                         ek = int(effective_k[i].item())
+                        commit_start_i = int(commit_start_per_req[i])
+                        commit_len_i = int(commit_len_per_req[i])
+                        recompute_len_i = (
+                            int(recompute_len_per_req[i])
+                            if recompute_len_per_req is not None
+                            and i < len(recompute_len_per_req)
+                            else int(emit_start + 1)
+                        )
+                        attempt_k_i = (
+                            int(attempt_k_per_req[i])
+                            if attempt_k_per_req is not None
+                            and i < len(attempt_k_per_req)
+                            else int(emit_len)
+                        )
                         sample_debug[i] = {
                             "step_idx": int(step_idxs[i]),
                             "phase": forward_batch.mtp_phase,
+                            "adaptive_window_mode": getattr(
+                                forward_batch, "mtp_adaptive_window_mode", None
+                            ),
                             "decode_q_len_per_req": int(q_len),
                             "emit_window_start": int(emit_start),
                             "emit_window_len": int(emit_len),
+                            "attempt_k": int(attempt_k_i),
+                            "recompute_len": int(recompute_len_i),
+                            "commit_start": int(commit_start_i),
+                            "commit_len": int(commit_len_i),
                             "strategy_kind": strategy_kind,
                             "conf_threshold": (
                                 float(forward_batch.mtp_conf_threshold)
@@ -2949,7 +3022,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 top1_conf[i, emit_start:emit_end][:ek]
                             ),
                             "committed_token_ids": _cap_row(
-                                logits_output.mtp_committed_token_ids[i][:ek]
+                                committed_rows[i, :commit_len_i]
                             ),
                             "positions_row": (
                                 _cap_row(positions_rows[i])

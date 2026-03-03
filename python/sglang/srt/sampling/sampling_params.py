@@ -69,6 +69,7 @@ class SamplingParams:
         mtp_k: int = 1,
         mtp_strategy: Optional[Union[str, Sequence[Any]]] = None,
         mtp_conf_threshold: Optional[float] = None,
+        mtp_adaptive_window_mode: str = "hf_exact",
         mtp_temperature: Optional[float] = None,
         mtp_mask_id: Optional[int] = None,
         mtp_min_mask_id: Optional[int] = None,
@@ -106,6 +107,7 @@ class SamplingParams:
         self.mtp_k = mtp_k
         self.mtp_strategy = mtp_strategy
         self.mtp_conf_threshold = mtp_conf_threshold
+        self.mtp_adaptive_window_mode = mtp_adaptive_window_mode
         self.mtp_temperature = mtp_temperature
         self.mtp_mask_id = mtp_mask_id
         self.mtp_min_mask_id = mtp_min_mask_id
@@ -122,6 +124,21 @@ class SamplingParams:
 
     def _parse_mtp_strategy(self):
         self.mtp_strategy_kind = None
+        if self.mtp_adaptive_window_mode is None:
+            self.mtp_adaptive_window_mode = "hf_exact"
+        elif isinstance(self.mtp_adaptive_window_mode, str):
+            self.mtp_adaptive_window_mode = self.mtp_adaptive_window_mode.strip().lower()
+        else:
+            raise ValueError(
+                "mtp_adaptive_window_mode must be a string in {'hf_exact', 'fixed_window'}."
+            )
+        if self.mtp_adaptive_window_mode not in {"hf_exact", "fixed_window"}:
+            raise ValueError(
+                "Unsupported mtp_adaptive_window_mode. Expected one of "
+                "{'hf_exact', 'fixed_window'}, got "
+                f"{self.mtp_adaptive_window_mode!r}."
+            )
+
         if self.mtp_strategy is None:
             return
 
@@ -295,6 +312,11 @@ class SamplingParams:
                 )
         if self.mtp_strategy_kind is not None and not self.mtp_enabled:
             raise ValueError("mtp_strategy requires mtp_enabled=true.")
+        if self.mtp_adaptive_window_mode == "fixed_window":
+            raise ValueError(
+                "mtp_adaptive_window_mode='fixed_window' is temporarily disabled in Phase 2C.1 "
+                "pending the KV ownership-ordering fix for non-prefix committed slices."
+            )
 
         grammars = [
             self.json_schema,

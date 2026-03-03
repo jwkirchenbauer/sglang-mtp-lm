@@ -660,13 +660,31 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             | freed_by_overalloc_range
             | retained_as_committed
         )
+        if missing_from_terminal_release:
+            raise ValueError(
+                "MTP terminal release ownership gap detected. "
+                f"rid={req.rid}, "
+                f"missing_count={len(missing_from_terminal_release)}, "
+                f"missing_sample={sorted(missing_from_terminal_release)[:16]}, "
+                f"step={req.mtp_debug_last_step_idx}, phase={req.mtp_debug_last_phase}, "
+                f"q_len={req.mtp_debug_last_req_q_len}, "
+                f"commit_start={getattr(req, 'mtp_debug_last_commit_start', 0)}, "
+                f"commit_len={req.mtp_debug_last_commit_len}, "
+                f"a_prev={getattr(req, 'mtp_debug_last_a_prev', 0)}, "
+                f"a_cur={getattr(req, 'mtp_debug_last_a_cur', 0)}"
+            )
         logger.info(
             "MTP terminal release ownership audit. "
             f"rid={req.rid}, "
             f"step={req.mtp_debug_last_step_idx}, "
             f"phase={req.mtp_debug_last_phase}, "
             f"req_q_len={req.mtp_debug_last_req_q_len}, "
+            f"attempt_k={getattr(req, 'mtp_debug_last_attempt_k', 0)}, "
+            f"recompute_len={getattr(req, 'mtp_debug_last_recompute_len', 0)}, "
+            f"commit_start={getattr(req, 'mtp_debug_last_commit_start', 0)}, "
             f"commit_len={req.mtp_debug_last_commit_len}, "
+            f"a_prev={getattr(req, 'mtp_debug_last_a_prev', 0)}, "
+            f"a_cur={getattr(req, 'mtp_debug_last_a_cur', 0)}, "
             f"curr_step_token_count={len(curr_step_tokens)}, "
             f"freed_by_tail_cleanup_count={len(freed_by_tail_cleanup)}, "
             f"freed_by_overalloc_range_count={len(freed_by_overalloc_range)}, "

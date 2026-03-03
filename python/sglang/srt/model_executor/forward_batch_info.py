@@ -283,7 +283,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mtp_phase: str = ""
     mtp_strategy_kind: Optional[str] = None
     mtp_conf_threshold: Optional[float] = None
+    mtp_adaptive_window_mode: Optional[str] = None
     mtp_decode_k_per_req: Optional[List[int]] = None
+    mtp_recompute_len_per_req: Optional[List[int]] = None
+    mtp_attempt_k_per_req: Optional[List[int]] = None
+    mtp_commit_start_per_req: Optional[List[int]] = None
+    mtp_commit_len_per_req: Optional[List[int]] = None
     mtp_debug_trace_enabled_per_req: Optional[List[bool]] = None
     mtp_debug_step_idx_per_req: Optional[List[int]] = None
 
@@ -398,7 +403,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mtp_phase=batch.mtp_phase,
             mtp_strategy_kind=batch.mtp_strategy_kind,
             mtp_conf_threshold=batch.mtp_conf_threshold,
+            mtp_adaptive_window_mode=batch.mtp_adaptive_window_mode,
             mtp_decode_k_per_req=batch.mtp_decode_k_per_req,
+            mtp_recompute_len_per_req=batch.mtp_recompute_len_per_req,
+            mtp_attempt_k_per_req=batch.mtp_attempt_k_per_req,
+            mtp_commit_start_per_req=batch.mtp_commit_start_per_req,
+            mtp_commit_len_per_req=batch.mtp_commit_len_per_req,
             mtp_debug_trace_enabled_per_req=batch.mtp_debug_trace_enabled_per_req,
             mtp_debug_step_idx_per_req=batch.mtp_debug_step_idx_per_req,
             req_pool_indices=batch.req_pool_indices,

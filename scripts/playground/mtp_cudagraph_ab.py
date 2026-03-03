@@ -50,7 +50,13 @@ TRACE_FIELDS = [
     "can_run_cuda_graph",
     "phase_before_step",
     "phase_after_step",
+    "adaptive_window_mode_runtime",
     "decode_q_len_per_req_runtime",
+    "a_prev_runtime",
+    "attempt_k_runtime",
+    "recompute_len_runtime",
+    "commit_start_runtime",
+    "commit_len_runtime",
     "decode_k_for_step_runtime",
     "effective_k_runtime",
     "finished_reason",
@@ -69,6 +75,8 @@ class Scenario:
     expected_seed_q: int
     expected_steady_q: int
     is_conf_adapt: bool
+    k_max: int
+    adaptive_window_mode: Optional[str] = None
 
 
 def _to_int_list(values: List[Any]) -> List[int]:
@@ -82,6 +90,7 @@ def build_scenarios(
     include_conf_adapt: bool,
     conf_adapt_k: int,
     conf_adapt_threshold: float,
+    conf_adapt_window_modes: List[str],
 ) -> List[Scenario]:
     scenarios: List[Scenario] = []
     for k in k_values:
@@ -106,31 +115,50 @@ def build_scenarios(
                 expected_seed_q=k,
                 expected_steady_q=(2 * k - 1) if k > 1 else 1,
                 is_conf_adapt=False,
+                k_max=k,
             )
         )
 
     if include_conf_adapt:
-        scenarios.append(
-            Scenario(
-                name=f"conf_adapt_k{conf_adapt_k}_t{conf_adapt_threshold}",
-                sampling_params={
-                    "temperature": 0,
-                    "top_k": 1,
-                    "max_new_tokens": max_new_tokens,
-                    "mtp_enabled": True,
-                    "mtp_k": conf_adapt_k,
-                    "mtp_strategy": ["conf_adapt", conf_adapt_threshold],
-                    "mtp_mask_id": mask_id,
-                    "custom_params": {
-                        "mtp_debug_trace": True,
-                        "mtp_debug_max_steps": max_new_tokens,
+        for mode in conf_adapt_window_modes:
+            normalized_mode = mode.strip().lower()
+            if normalized_mode == "fixed_window":
+                raise ValueError(
+                    "conf_adapt fixed_window scenarios are disabled in Phase 2C.1 "
+                    "pending KV ownership-ordering fixes."
+                )
+            if normalized_mode != "hf_exact":
+                raise ValueError(
+                    f"Unsupported conf-adapt window mode: {mode!r}. "
+                    "Expected 'hf_exact' for Phase 2C.1."
+                )
+            scenarios.append(
+                Scenario(
+                    name=(
+                        f"conf_adapt_k{conf_adapt_k}_t{conf_adapt_threshold}"
+                        f"_{normalized_mode}"
+                    ),
+                    sampling_params={
+                        "temperature": 0,
+                        "top_k": 1,
+                        "max_new_tokens": max_new_tokens,
+                        "mtp_enabled": True,
+                        "mtp_k": conf_adapt_k,
+                        "mtp_strategy": ["conf_adapt", conf_adapt_threshold],
+                        "mtp_adaptive_window_mode": normalized_mode,
+                        "mtp_mask_id": mask_id,
+                        "custom_params": {
+                            "mtp_debug_trace": True,
+                            "mtp_debug_max_steps": max_new_tokens,
+                        },
                     },
-                },
-                expected_seed_q=conf_adapt_k,
-                expected_steady_q=1,  # expected typical conf_adapt behavior after seed
-                is_conf_adapt=True,
+                    expected_seed_q=conf_adapt_k,
+                    expected_steady_q=-1,
+                    is_conf_adapt=True,
+                    k_max=conf_adapt_k,
+                    adaptive_window_mode=normalized_mode,
+                )
             )
-        )
 
     return scenarios
 
@@ -206,11 +234,80 @@ def find_trace_issues(
             continue
         phase = row.get("phase_before_step")
         q_runtime = row.get("decode_q_len_per_req_runtime")
-        if phase == "steady" and q_runtime is not None and not scenario.is_conf_adapt:
-            if int(q_runtime) != int(scenario.expected_steady_q):
+        if phase == "steady" and q_runtime is not None:
+            if not scenario.is_conf_adapt and int(q_runtime) != int(
+                scenario.expected_steady_q
+            ):
                 issues.append(
                     f"steady_q_mismatch_at_step_{idx}_expected_{scenario.expected_steady_q}_got_{q_runtime}"
                 )
+                continue
+
+            attempt_k = row.get("attempt_k_runtime")
+            if attempt_k is not None and int(attempt_k) != int(scenario.k_max):
+                issues.append(
+                    f"attempt_k_mismatch_at_step_{idx}_expected_{scenario.k_max}_got_{attempt_k}"
+                )
+
+            if scenario.is_conf_adapt:
+                mode_runtime = row.get("adaptive_window_mode_runtime")
+                if (
+                    mode_runtime is not None
+                    and scenario.adaptive_window_mode is not None
+                    and str(mode_runtime) != str(scenario.adaptive_window_mode)
+                ):
+                    issues.append(
+                        f"adaptive_mode_mismatch_at_step_{idx}_expected_{scenario.adaptive_window_mode}_got_{mode_runtime}"
+                    )
+
+                a_prev = row.get("a_prev_runtime")
+                recompute_len = row.get("recompute_len_runtime")
+                commit_start = row.get("commit_start_runtime")
+                commit_len = row.get("commit_len_runtime")
+                ek = row.get("effective_k_runtime")
+
+                if commit_len is not None and a_prev is not None and int(commit_len) != int(a_prev):
+                    issues.append(
+                        f"commit_len_vs_a_prev_mismatch_at_step_{idx}_commit_len_{commit_len}_a_prev_{a_prev}"
+                    )
+                if ek is not None and not (1 <= int(ek) <= int(scenario.k_max)):
+                    issues.append(
+                        f"effective_k_out_of_range_at_step_{idx}_kmax_{scenario.k_max}_effective_k_{ek}"
+                    )
+
+                if scenario.adaptive_window_mode == "hf_exact":
+                    if (
+                        recompute_len is not None
+                        and a_prev is not None
+                        and int(recompute_len) != int(a_prev)
+                    ):
+                        issues.append(
+                            f"hf_exact_recompute_mismatch_at_step_{idx}_recompute_{recompute_len}_a_prev_{a_prev}"
+                        )
+                    if q_runtime is not None and a_prev is not None:
+                        expected_q = int(a_prev) + int(scenario.k_max) - 1
+                        if int(q_runtime) != expected_q:
+                            issues.append(
+                                f"hf_exact_q_mismatch_at_step_{idx}_expected_{expected_q}_got_{q_runtime}"
+                            )
+                elif scenario.adaptive_window_mode == "fixed_window":
+                    expected_q = 2 * int(scenario.k_max) - 1
+                    if int(q_runtime) != expected_q:
+                        issues.append(
+                            f"fixed_window_q_mismatch_at_step_{idx}_expected_{expected_q}_got_{q_runtime}"
+                        )
+                    if recompute_len is not None and int(recompute_len) != int(scenario.k_max):
+                        issues.append(
+                            f"fixed_window_recompute_mismatch_at_step_{idx}_expected_{scenario.k_max}_got_{recompute_len}"
+                        )
+                    if (
+                        commit_start is not None
+                        and a_prev is not None
+                        and int(commit_start) != int(scenario.k_max) - int(a_prev)
+                    ):
+                        issues.append(
+                            f"fixed_window_commit_start_mismatch_at_step_{idx}_expected_{int(scenario.k_max)-int(a_prev)}_got_{commit_start}"
+                        )
 
     if expect_q_gt1_graph and not scenario.is_conf_adapt and scenario.expected_seed_q > 1:
         for idx, row in enumerate(trace):
@@ -221,15 +318,26 @@ def find_trace_issues(
                 break
 
     if scenario.is_conf_adapt:
-        # conf_adapt q>1 should stay eager for q>1 rows.
-        for idx, row in enumerate(trace):
-            if row is None:
-                continue
-            q_runtime = row.get("decode_q_len_per_req_runtime")
-            can_graph = row.get("can_run_cuda_graph")
-            if q_runtime is not None and int(q_runtime) > 1 and can_graph is True:
-                issues.append(f"conf_adapt_q_gt1_used_graph_at_step_{idx}")
-                break
+        if scenario.adaptive_window_mode == "hf_exact":
+            for idx, row in enumerate(trace):
+                if row is None:
+                    continue
+                q_runtime = row.get("decode_q_len_per_req_runtime")
+                can_graph = row.get("can_run_cuda_graph")
+                if q_runtime is not None and int(q_runtime) > 1 and can_graph is True:
+                    issues.append(f"conf_adapt_hf_exact_q_gt1_used_graph_at_step_{idx}")
+                    break
+        elif scenario.adaptive_window_mode == "fixed_window" and expect_q_gt1_graph:
+            for idx, row in enumerate(trace):
+                if row is None:
+                    continue
+                q_runtime = row.get("decode_q_len_per_req_runtime")
+                if q_runtime is not None and int(q_runtime) > 1:
+                    if row.get("can_run_cuda_graph") is not True:
+                        issues.append(
+                            f"conf_adapt_fixed_window_q_gt1_graph_not_enabled_at_step_{idx}"
+                        )
+                        break
 
     return issues
 
@@ -416,6 +524,13 @@ def parse_args():
     parser.add_argument("--conf-adapt-k", type=int, default=8)
     parser.add_argument("--conf-adapt-threshold", type=float, default=0.9)
     parser.add_argument(
+        "--conf-adapt-window-modes",
+        type=str,
+        nargs="+",
+        default=["hf_exact"],
+        help="Adaptive window modes to include in conf_adapt scenarios (Phase 2C.1: hf_exact only).",
+    )
+    parser.add_argument(
         "--allow-qgt1-eager",
         action="store_true",
         help="Allow q>1 static scenarios to run eagerly (do not require can_run_cuda_graph=true).",
@@ -460,6 +575,7 @@ def main():
         include_conf_adapt=bool(args.include_conf_adapt),
         conf_adapt_k=int(args.conf_adapt_k),
         conf_adapt_threshold=float(args.conf_adapt_threshold),
+        conf_adapt_window_modes=list(args.conf_adapt_window_modes),
     )
     expect_qgt1_graph = not bool(args.allow_qgt1_eager)
 

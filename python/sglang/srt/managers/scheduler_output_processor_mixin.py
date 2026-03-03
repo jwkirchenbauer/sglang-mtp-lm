@@ -481,8 +481,13 @@ class SchedulerOutputProcessorMixin:
                         if mtp_committed_token_ids is not None
                         else []
                     )
-                    if mtp_effective_k_per_req is not None:
-                        committed_ids = committed_ids[: int(mtp_effective_k_per_req[i])]
+                    commit_len = (
+                        int(batch.mtp_commit_len_per_req[i])
+                        if batch.mtp_commit_len_per_req is not None
+                        and i < len(batch.mtp_commit_len_per_req)
+                        else len(committed_ids)
+                    )
+                    committed_ids = committed_ids[:commit_len]
                     total_generated += len(committed_ids)
                 else:
                     total_generated += len(next_token_id) if isinstance(next_token_id, list) else 1
@@ -524,55 +529,102 @@ class SchedulerOutputProcessorMixin:
             kv_allocated_len_before = int(req.kv_allocated_len)
             req_q_len = batch.decode_q_len_per_req if is_mtp_req else 1
             curr_step_cache_loc = None
+            phase_for_step = ""
             if is_mtp_req:
                 start = i * req_q_len
                 curr_step_cache_loc = batch.out_cache_loc[start : start + req_q_len]
+                phase_for_step = req.mtp_phase_for_step()
+            decode_k_this_step = 1
+            recompute_len_this_step = 1
+            attempt_k_this_step = 1
+            commit_start_this_step = 0
+            commit_len_this_step = 1
+            a_prev_this_step = 1
+            effective_k_this_step = 1
 
             new_accepted_len = 1
+            committed_ids_runtime: List[int] = []
             if batch.spec_algorithm.is_none():
                 if is_mtp_req:
-                    decode_k_this_step = (
-                        int(batch.mtp_decode_k_per_req[i])
-                        if batch.mtp_decode_k_per_req is not None
-                        and i < len(batch.mtp_decode_k_per_req)
-                        else int(req.mtp_decode_k_for_step())
+                    recompute_len_this_step = (
+                        int(batch.mtp_recompute_len_per_req[i])
+                        if batch.mtp_recompute_len_per_req is not None
+                        and i < len(batch.mtp_recompute_len_per_req)
+                        else int(req.mtp_recompute_len_for_step())
                     )
+                    decode_k_this_step = recompute_len_this_step
+                    attempt_k_this_step = (
+                        int(batch.mtp_attempt_k_per_req[i])
+                        if batch.mtp_attempt_k_per_req is not None
+                        and i < len(batch.mtp_attempt_k_per_req)
+                        else int(req.mtp_attempt_k_for_step())
+                    )
+                    commit_start_this_step = (
+                        int(batch.mtp_commit_start_per_req[i])
+                        if batch.mtp_commit_start_per_req is not None
+                        and i < len(batch.mtp_commit_start_per_req)
+                        else int(req.mtp_commit_slice_for_step()[0])
+                    )
+                    commit_len_this_step = (
+                        int(batch.mtp_commit_len_per_req[i])
+                        if batch.mtp_commit_len_per_req is not None
+                        and i < len(batch.mtp_commit_len_per_req)
+                        else int(req.mtp_commit_slice_for_step()[1])
+                    )
+                    a_prev_this_step = (
+                        1
+                        if phase_for_step == "seed"
+                        else len(req.mtp_pending_tokens_for_step())
+                    )
+
+                    if phase_for_step != "seed" and commit_len_this_step != a_prev_this_step:
+                        raise ValueError(
+                            "MTP steady-step commit length must match previous accepted length. "
+                            f"rid={req.rid}, commit_len={commit_len_this_step}, a_prev={a_prev_this_step}, "
+                            f"phase={phase_for_step}."
+                        )
+                    if (
+                        phase_for_step != "seed"
+                        and req.mtp_strategy_kind == "conf_adapt"
+                        and str(getattr(batch, "mtp_adaptive_window_mode", "hf_exact"))
+                        == "hf_exact"
+                        and commit_start_this_step != 0
+                    ):
+                        raise ValueError(
+                            "hf_exact steady-step commit must start at prefix (commit_start == 0). "
+                            f"rid={req.rid}, commit_start={commit_start_this_step}, "
+                            f"a_prev={a_prev_this_step}, q_len={req_q_len}."
+                        )
+
                     effective_k_this_step = (
                         int(mtp_effective_k_per_req[i])
                         if mtp_effective_k_per_req is not None
-                        else decode_k_this_step
+                        else attempt_k_this_step
                     )
-                    if effective_k_this_step < 1:
-                        effective_k_this_step = 1
+                    k_max_this_step = int(req.sampling_params.mtp_k)
+                    if not (1 <= effective_k_this_step <= k_max_this_step):
+                        raise ValueError(
+                            "Invalid current-step accepted length for MTP decode. "
+                            f"rid={req.rid}, a_cur={effective_k_this_step}, "
+                            f"attempt_k={attempt_k_this_step}, k_max={k_max_this_step}."
+                        )
+
                     committed_ids = (
                         mtp_committed_token_ids[i]
                         if mtp_committed_token_ids is not None
                         else []
                     )
-                    if committed_ids:
-                        committed_ids = [int(x) for x in committed_ids[:effective_k_this_step]]
-                    if req.sampling_params.mtp_k == 1 and len(committed_ids) == 0:
-                        # Defensive fallback: k=1 must always commit one token.
-                        if isinstance(next_token_id, list):
-                            if len(next_token_id) > 0:
-                                committed_ids = [int(next_token_id[0])]
-                        else:
-                            committed_ids = [int(next_token_id)]
-                    if committed_ids:
-                        req.output_ids.extend(int(x) for x in committed_ids)
-                        new_accepted_len = len(committed_ids)
-                    else:
-                        new_accepted_len = 0
-                    if (
-                        req.sampling_params.mtp_k == 1
-                        and new_accepted_len != 1
-                        and not req.finished()
-                        and not req.is_retracted
-                    ):
+                    committed_ids = [int(x) for x in committed_ids[:commit_len_this_step]]
+                    if len(committed_ids) != commit_len_this_step:
                         raise ValueError(
-                            "MTP k=1 decode must commit exactly one token per step. "
-                            f"rid={req.rid}, got new_accepted_len={new_accepted_len}."
+                            "Unexpected MTP committed token count after decode sampling. "
+                            f"rid={req.rid}, expected={commit_len_this_step}, got={len(committed_ids)}, "
+                            f"phase={phase_for_step}, q_len={req_q_len}."
                         )
+
+                    req.output_ids.extend(committed_ids)
+                    committed_ids_runtime = committed_ids
+                    new_accepted_len = len(committed_ids)
                 elif isinstance(next_token_id, list):
                     req.output_ids.extend(next_token_id)
                     new_accepted_len = len(next_token_id)
@@ -595,8 +647,15 @@ class SchedulerOutputProcessorMixin:
                             "argmax_row_token_ids": sample_entry.get(
                                 "argmax_row_token_ids", []
                             ),
+                            "adaptive_window_mode": sample_entry.get(
+                                "adaptive_window_mode"
+                            ),
                             "strategy_kind": sample_entry.get("strategy_kind"),
                             "conf_threshold": sample_entry.get("conf_threshold"),
+                            "attempt_k": sample_entry.get("attempt_k"),
+                            "recompute_len": sample_entry.get("recompute_len"),
+                            "commit_start": sample_entry.get("commit_start"),
+                            "commit_len": sample_entry.get("commit_len"),
                             "effective_k": sample_entry.get("effective_k"),
                             "pending_token_ids": sample_entry.get(
                                 "pending_token_ids", []
@@ -623,7 +682,7 @@ class SchedulerOutputProcessorMixin:
                                 break
                         argmax_ids = sample_entry.get("argmax_row_token_ids", [])
                         pending_ids = sample_entry.get("pending_token_ids", [])
-                        committed_ids = sample_entry.get("committed_token_ids", [])
+                        committed_ids_dbg = sample_entry.get("committed_token_ids", [])
                         logger.info(
                             "[MTP_DEBUG_FIRST] "
                             f"rid={req.rid} "
@@ -635,8 +694,8 @@ class SchedulerOutputProcessorMixin:
                             f"argmax_text={req._mtp_debug_decode_token_ids(argmax_ids)!r} "
                             f"pending_ids={pending_ids} "
                             f"pending_text={req._mtp_debug_decode_token_ids(pending_ids)!r} "
-                            f"committed_ids={committed_ids} "
-                            f"committed_text={req._mtp_debug_decode_token_ids(committed_ids)!r}"
+                            f"committed_ids={committed_ids_dbg} "
+                            f"committed_text={req._mtp_debug_decode_token_ids(committed_ids_dbg)!r}"
                         )
                         req.mtp_debug_logged_first_argmax = True
 
@@ -649,20 +708,24 @@ class SchedulerOutputProcessorMixin:
                     req.kv_allocated_len -= int(req.mtp_overlap_prev_step_cache_loc.numel())
                     req.mtp_overlap_prev_step_cache_loc = None
 
-                if mtp_effective_k_per_req is not None and req.mtp_phase != "seed":
-                    req.mtp_commit_len = int(mtp_effective_k_per_req[i])
-                    if req.mtp_commit_len < 1:
-                        req.mtp_commit_len = 1
+                req.mtp_commit_len = int(commit_len_this_step)
+                req.mtp_step_recompute_len = int(recompute_len_this_step)
+                req.mtp_step_attempt_k = int(attempt_k_this_step)
+                req.mtp_step_commit_start = int(commit_start_this_step)
+                req.mtp_step_commit_len = int(commit_len_this_step)
                 req.kv_committed_len += req.mtp_commit_len
+                if req.kv_committed_len > req.kv_allocated_len:
+                    raise ValueError(
+                        "Invalid KV lengths after MTP commit update. "
+                        f"rid={req.rid}, kv_committed_len={req.kv_committed_len}, "
+                        f"kv_allocated_len={req.kv_allocated_len}, "
+                        f"phase={phase_for_step}, commit_len={commit_len_this_step}."
+                    )
                 if isinstance(next_token_id, list):
                     next_token_ids_list = [int(x) for x in next_token_id]
                 else:
                     next_token_ids_list = [int(next_token_id)]
-                expected_pending_len = (
-                    int(mtp_effective_k_per_req[i])
-                    if mtp_effective_k_per_req is not None
-                    else decode_k_this_step
-                )
+                expected_pending_len = int(effective_k_this_step)
                 req.mtp_pending_tokens = next_token_ids_list[:expected_pending_len]
                 if len(req.mtp_pending_tokens) != expected_pending_len:
                     raise ValueError(
@@ -673,13 +736,68 @@ class SchedulerOutputProcessorMixin:
                 req.mtp_effective_k = len(req.mtp_pending_tokens)
                 req.clear_mtp_overlap_provisional(upto_step_idx=processed_step_idx)
 
-                if req_q_len > req.mtp_commit_len:
-                    req.mtp_prev_step_cache_loc = curr_step_cache_loc[
-                        req.mtp_commit_len :
-                    ].clone()
+                commit_end_this_step = commit_start_this_step + commit_len_this_step
+                if (
+                    commit_start_this_step < 0
+                    or commit_len_this_step < 1
+                    or commit_end_this_step > req_q_len
+                ):
+                    raise ValueError(
+                        "Invalid MTP commit region in output processor. "
+                        f"rid={req.rid}, q_len={req_q_len}, commit_start={commit_start_this_step}, "
+                        f"commit_len={commit_len_this_step}."
+                    )
+                tail_parts = []
+                if commit_start_this_step > 0:
+                    tail_parts.append(curr_step_cache_loc[:commit_start_this_step])
+                if commit_end_this_step < req_q_len:
+                    tail_parts.append(curr_step_cache_loc[commit_end_this_step:])
+                if tail_parts:
+                    req.mtp_prev_step_cache_loc = (
+                        torch.cat(tail_parts).clone()
+                        if len(tail_parts) > 1
+                        else tail_parts[0].clone()
+                    )
+                else:
+                    req.mtp_prev_step_cache_loc = None
+
+                if curr_step_cache_loc is not None:
+                    committed_region = curr_step_cache_loc[
+                        commit_start_this_step:commit_end_this_step
+                    ]
+                    committed_set = set(int(x) for x in committed_region.tolist())
+                    tail_set = (
+                        set(int(x) for x in req.mtp_prev_step_cache_loc.tolist())
+                        if req.mtp_prev_step_cache_loc is not None
+                        else set()
+                    )
+                    overlap = committed_set.intersection(tail_set)
+                    if overlap:
+                        raise ValueError(
+                            "Detected overlap between committed MTP cache region and deferred tail ownership. "
+                            f"rid={req.rid}, overlap_sample={sorted(overlap)[:16]}, "
+                            f"commit_start={commit_start_this_step}, commit_len={commit_len_this_step}, "
+                            f"q_len={req_q_len}."
+                        )
+
+                if req.kv_committed_len > req.kv_allocated_len:
+                    raise ValueError(
+                        "Invalid KV lengths after MTP tail ownership split. "
+                        f"rid={req.rid}, kv_committed_len={req.kv_committed_len}, "
+                        f"kv_allocated_len={req.kv_allocated_len}, "
+                        f"phase={phase_for_step}, commit_start={commit_start_this_step}, "
+                        f"commit_len={commit_len_this_step}, q_len={req_q_len}."
+                    )
 
                 if req.mtp_phase == "seed":
                     req.mtp_phase = "steady"
+
+                if envs.SGLANG_MTP_KV_LEAK_DEBUG.get():
+                    logger.info(
+                        "MTP transition tuple (end_output_processing_step). "
+                        f"tuple={(str(req.rid), str(phase_for_step), int(a_prev_this_step), int(req_q_len), int(commit_start_this_step), int(commit_len_this_step), int(effective_k_this_step), int(req.kv_committed_len), int(req.kv_allocated_len), bool(req.mtp_prev_step_cache_loc is not None or req.mtp_overlap_prev_step_cache_loc is not None))}, "
+                        "lifecycle_source=decode"
+                    )
 
                 req.mtp_debug_upsert_step(
                     debug_step_idx,
@@ -687,12 +805,18 @@ class SchedulerOutputProcessorMixin:
                         "can_run_cuda_graph": bool(can_run_cuda_graph),
                         "phase_before_step": batch.mtp_phase,
                         "decode_q_len_per_req_runtime": int(req_q_len),
-                        "decode_k_for_step_runtime": int(decode_k_this_step),
-                        "effective_k_runtime": int(
-                            effective_k_this_step
+                        "adaptive_window_mode_runtime": str(
+                            getattr(batch, "mtp_adaptive_window_mode", "hf_exact")
                         ),
+                        "a_prev_runtime": int(a_prev_this_step),
+                        "attempt_k_runtime": int(attempt_k_this_step),
+                        "recompute_len_runtime": int(recompute_len_this_step),
+                        "commit_start_runtime": int(commit_start_this_step),
+                        "commit_len_runtime": int(commit_len_this_step),
+                        "decode_k_for_step_runtime": int(decode_k_this_step),
+                        "effective_k_runtime": int(effective_k_this_step),
                         "committed_appended_to_output_ids": req._mtp_debug_cap_token_ids(
-                            committed_ids if isinstance(committed_ids, list) else []
+                            committed_ids_runtime
                         ),
                         "pending_saved_for_next_step": req._mtp_debug_cap_token_ids(
                             req.mtp_pending_tokens
@@ -711,6 +835,11 @@ class SchedulerOutputProcessorMixin:
                     req.mtp_debug_last_phase = str(batch.mtp_phase)
                     req.mtp_debug_last_req_q_len = int(req_q_len)
                     req.mtp_debug_last_commit_len = int(req.mtp_commit_len)
+                    req.mtp_debug_last_commit_start = int(commit_start_this_step)
+                    req.mtp_debug_last_recompute_len = int(recompute_len_this_step)
+                    req.mtp_debug_last_attempt_k = int(attempt_k_this_step)
+                    req.mtp_debug_last_a_prev = int(a_prev_this_step)
+                    req.mtp_debug_last_a_cur = int(effective_k_this_step)
                     req.mtp_debug_last_curr_step_cache_loc = (
                         curr_step_cache_loc.detach().clone()
                         if curr_step_cache_loc is not None
@@ -817,11 +946,19 @@ class SchedulerOutputProcessorMixin:
                     if batch.spec_algorithm.is_none():
                         # Normal decode: single token or MTP token list.
                         if is_mtp_req:
+                            commit_len = (
+                                int(batch.mtp_commit_len_per_req[i])
+                                if batch.mtp_commit_len_per_req is not None
+                                and i < len(batch.mtp_commit_len_per_req)
+                                else None
+                            )
                             committed_ids = (
                                 mtp_committed_token_ids[i]
                                 if mtp_committed_token_ids is not None
                                 else []
                             )
+                            if commit_len is not None:
+                                committed_ids = committed_ids[:commit_len]
                             for token_id in committed_ids:
                                 req.grammar.accept_token(token_id)
                         elif isinstance(next_token_id, list):

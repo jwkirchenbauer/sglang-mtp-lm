@@ -209,6 +209,12 @@ class SchedulerMetricsMixin:
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
+        paused_queue_reqs = (
+            self._paused_mtp_req_count()
+            if hasattr(self, "_paused_mtp_req_count")
+            else 0
+        )
+        total_queue_reqs = len(self.waiting_queue) + paused_queue_reqs
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -217,7 +223,8 @@ class SchedulerMetricsMixin:
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.running_bs}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
+            f"#queue-req: {total_queue_reqs}, "
+            f"#paused-req: {paused_queue_reqs}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -262,7 +269,7 @@ class SchedulerMetricsMixin:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
-            self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_queue_reqs = total_queue_reqs
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -270,7 +277,7 @@ class SchedulerMetricsMixin:
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
-            self.stats.num_paused_reqs = self.num_paused_reqs
+            self.stats.num_paused_reqs = paused_queue_reqs
             self.num_retracted_reqs = self.num_paused_reqs = 0
 
             # PD disaggregation
@@ -305,6 +312,12 @@ class SchedulerMetricsMixin:
         self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
     ):
         batch = running_batch or self.running_batch
+        paused_queue_reqs = (
+            self._paused_mtp_req_count()
+            if hasattr(self, "_paused_mtp_req_count")
+            else 0
+        )
+        total_queue_reqs = len(self.waiting_queue) + paused_queue_reqs
 
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
@@ -409,7 +422,8 @@ class SchedulerMetricsMixin:
         msg += (
             f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
+            f"#queue-req: {total_queue_reqs}, "
+            f"#paused-req: {paused_queue_reqs}"
         )
 
         logger.info(msg)
@@ -425,7 +439,7 @@ class SchedulerMetricsMixin:
                 self.stats.mamba_usage = mamba_usage
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
-            self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_queue_reqs = total_queue_reqs
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
@@ -437,7 +451,7 @@ class SchedulerMetricsMixin:
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
-            self.stats.num_paused_reqs = self.num_paused_reqs
+            self.stats.num_paused_reqs = paused_queue_reqs
             self.num_retracted_reqs = self.num_paused_reqs = 0
 
             # PD disaggregation
@@ -636,6 +650,11 @@ class SchedulerMetricsMixin:
         num_running_reqs = len(self.running_batch.reqs)
 
         waiting_queues = [self.waiting_queue]
+        paused_queue_reqs = (
+            self._paused_mtp_req_count()
+            if hasattr(self, "_paused_mtp_req_count")
+            else 0
+        )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -643,7 +662,7 @@ class SchedulerMetricsMixin:
             waiting_queues.append(self.disagg_decode_transfer_queue.queue)
             waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
 
-        num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
+        num_waiting_reqs = sum(len(queue) for queue in waiting_queues) + paused_queue_reqs
 
         if self.is_hybrid_swa:
             full_num_used, swa_num_used, *_ = self._get_swa_token_info()
@@ -730,9 +749,9 @@ class SchedulerMetricsMixin:
         queues = None
         if include_all or "queues" in include:
             queues = QueueMetrics(
-                waiting=len(self.waiting_queue),
+                waiting=len(self.waiting_queue) + paused_queue_reqs,
                 grammar=self.stats.num_grammar_queue_reqs,
-                paused=self.stats.num_paused_reqs,
+                paused=paused_queue_reqs,
                 retracted=self.stats.num_retracted_reqs,
             )
 
