@@ -2175,6 +2175,76 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             q_lens.add(2 * k - 1)
         return sorted(q_len for q_len in q_lens if q_len > 1)
 
+    def _get_mtp_adaptive_hf_exact_cuda_graph_capture_q_lens(self) -> List[int]:
+        kmax_list = (
+            getattr(self.server_args, "mtp_adaptive_cuda_graph_kmax_list", None) or []
+        )
+        canonical_banding_enabled = bool(
+            getattr(
+                self.server_args,
+                "enable_mtp_adaptive_hf_exact_canonical_q_banding",
+                False,
+            )
+        )
+        canonical_q_lens = sorted(
+            {
+                int(q)
+                for q in (
+                    getattr(self.server_args, "mtp_adaptive_canonical_q_lens", None)
+                    or []
+                )
+                if int(q) > 1
+            }
+        )
+        q_lens = set()
+        for kmax in kmax_list:
+            kmax = int(kmax)
+            if kmax <= 1:
+                continue
+            # Seed phase always uses q_len=kmax for conf_adapt decode.
+            q_lens.add(kmax)
+
+            # Steady phase q_len follows either native hf_exact or canonical rounding:
+            # base_q in [kmax, 2*kmax-1] -> selected_q in same range.
+            for base_q in range(kmax, 2 * kmax):
+                selected_q = int(base_q)
+                if canonical_banding_enabled and len(canonical_q_lens) > 0:
+                    candidates = [
+                        q
+                        for q in canonical_q_lens
+                        if int(base_q) <= int(q) <= (2 * kmax - 1)
+                    ]
+                    if len(candidates) > 0:
+                        selected_q = int(min(candidates))
+                q_lens.add(selected_q)
+        return sorted(q_len for q_len in q_lens if q_len > 1)
+
+    def _get_mtp_q_len_cuda_graph_capture_q_lens(
+        self,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        static_q_lens = (
+            self._get_mtp_static_cuda_graph_capture_q_lens()
+            if bool(
+                getattr(self.server_args, "enable_mtp_static_q_len_cuda_graph", False)
+            )
+            else []
+        )
+        adaptive_hf_exact_q_lens = (
+            self._get_mtp_adaptive_hf_exact_cuda_graph_capture_q_lens()
+            if bool(
+                getattr(
+                    self.server_args,
+                    "enable_mtp_adaptive_hf_exact_q_len_cuda_graph",
+                    False,
+                )
+            )
+            else []
+        )
+        capture_q_lens = sorted(
+            set(static_q_lens).union(set(adaptive_hf_exact_q_lens))
+        )
+        return static_q_lens, adaptive_hf_exact_q_lens, capture_q_lens
+
     def _is_flashinfer_workspace_overflow_error(self, exc: Exception) -> bool:
         msg = str(exc)
         return (
@@ -2198,28 +2268,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _init_mtp_static_cuda_graph_runners(self):
         if self.device == "cpu" or not isinstance(self.graph_runner, CudaGraphRunner):
             return
-        if not bool(
-            getattr(self.server_args, "enable_mtp_static_q_len_cuda_graph", False)
+        if not (
+            bool(getattr(self.server_args, "enable_mtp_static_q_len_cuda_graph", False))
+            or bool(
+                getattr(
+                    self.server_args,
+                    "enable_mtp_adaptive_hf_exact_q_len_cuda_graph",
+                    False,
+                )
+            )
         ):
             return
 
-        capture_q_lens = self._get_mtp_static_cuda_graph_capture_q_lens()
+        (
+            static_q_lens,
+            adaptive_hf_exact_q_lens,
+            capture_q_lens,
+        ) = self._get_mtp_q_len_cuda_graph_capture_q_lens()
         if len(capture_q_lens) == 0:
             logger.warning(
-                "Static MTP q>1 cuda graph is enabled but configured k-list does not produce q_len>1 captures. "
+                "MTP q>1 cuda graph is enabled but configured capture lists do not produce q_len>1 captures. "
                 "q_len>1 decode will stay eager."
             )
             return
 
         logger.info(
-            "Capture static MTP q>1 cuda graph runners. q_lens=%s",
+            "Capture MTP q>1 cuda graph runners. static_q_lens=%s adaptive_hf_exact_q_lens=%s capture_q_lens=%s",
+            static_q_lens,
+            adaptive_hf_exact_q_lens,
             capture_q_lens,
         )
         original_cuda_graph_bs = list(getattr(self.server_args, "cuda_graph_bs", []) or [])
         bs_caps = self._get_mtp_static_cuda_graph_bs_candidates()
         if len(bs_caps) == 0:
             logger.warning(
-                "No cuda_graph_bs available for static MTP q>1 pre-capture; q_len>1 decode will stay eager."
+                "No cuda_graph_bs available for MTP q>1 pre-capture; q_len>1 decode will stay eager."
             )
             return
 
@@ -2239,7 +2322,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                     if cap < max(original_cuda_graph_bs):
                         logger.warning(
-                            "Captured static MTP q_len=%d with reduced cuda_graph_bs cap=%d due workspace limits.",
+                            "Captured MTP q_len=%d with reduced cuda_graph_bs cap=%d due workspace limits.",
                             decode_q_len,
                             cap,
                         )
@@ -2249,7 +2332,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     if self._is_flashinfer_workspace_overflow_error(exc):
                         last_workspace_err = exc
                         logger.warning(
-                            "Static MTP q_len=%d pre-capture overflow at cap=%d, retrying smaller cap.",
+                            "MTP q_len=%d pre-capture overflow at cap=%d, retrying smaller cap.",
                             decode_q_len,
                             cap,
                         )
@@ -2260,7 +2343,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             if not captured:
                 logger.warning(
-                    "Failed to pre-capture static MTP q_len=%d due workspace limits. Falling back to eager for this q_len. last_error=%s",
+                    "Failed to pre-capture MTP q_len=%d due workspace limits. Falling back to eager for this q_len. last_error=%s",
                     decode_q_len,
                     str(last_workspace_err) if last_workspace_err is not None else "n/a",
                 )
@@ -2359,10 +2442,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False, "not_decode"
         if int(getattr(forward_batch, "decode_q_len_per_req", 1)) <= 1:
             return False, "q_len_le_1"
-        if not bool(
-            getattr(self.server_args, "enable_mtp_static_q_len_cuda_graph", False)
-        ):
-            return False, "flag_disabled"
         force_eager_reason = getattr(
             self.attn_backend, "q_len_gt1_decode_cuda_graph_force_eager_reason", None
         )
@@ -2380,22 +2459,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if force_eager_reason is not None:
             return False, str(force_eager_reason)
 
-        # q_len>1 graph replay is staged only for static MTP decode (seed/steady)
-        # with startup pre-captured q-lens.
+        # q_len>1 graph replay is staged for MTP decode (seed/steady) with
+        # startup pre-captured q-lens.
         phase = getattr(forward_batch, "mtp_phase", None)
         if phase not in {"seed", "steady"}:
             return False, f"phase_{phase}"
+        static_q_len_graph_enabled = bool(
+            getattr(self.server_args, "enable_mtp_static_q_len_cuda_graph", False)
+        )
+        adaptive_hf_exact_q_len_graph_enabled = bool(
+            getattr(
+                self.server_args, "enable_mtp_adaptive_hf_exact_q_len_cuda_graph", False
+            )
+        )
         strategy_kind = getattr(forward_batch, "mtp_strategy_kind", None)
         if strategy_kind is None:
-            pass
+            if not static_q_len_graph_enabled:
+                return False, "flag_disabled"
         elif strategy_kind == "conf_adapt":
             mode = getattr(forward_batch, "mtp_adaptive_window_mode", "hf_exact")
-            if mode != "fixed_window":
+            if mode != "hf_exact":
                 return False, f"adaptive_mode_{mode}"
+            if not adaptive_hf_exact_q_len_graph_enabled:
+                return False, "adaptive_hf_exact_flag_disabled"
         else:
             return False, f"strategy_{strategy_kind}"
         decode_q_len = int(getattr(forward_batch, "decode_q_len_per_req", 1))
         if decode_q_len not in self.mtp_decode_graph_runners:
+            if strategy_kind == "conf_adapt":
+                return False, "adaptive_hf_exact_q_len_not_precaptured"
             return False, "q_len_not_precaptured"
         return True, "eligible"
 
@@ -2652,10 +2744,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                     False,
                                 )
                             ),
+                            "enable_mtp_adaptive_hf_exact_q_len_cuda_graph": bool(
+                                getattr(
+                                    self.server_args,
+                                    "enable_mtp_adaptive_hf_exact_q_len_cuda_graph",
+                                    False,
+                                )
+                            ),
                             "mtp_static_cuda_graph_k_list": list(
                                 getattr(
                                     self.server_args,
                                     "mtp_static_cuda_graph_k_list",
+                                    [],
+                                )
+                            ),
+                            "mtp_adaptive_cuda_graph_kmax_list": list(
+                                getattr(
+                                    self.server_args,
+                                    "mtp_adaptive_cuda_graph_kmax_list",
+                                    [],
+                                )
+                            ),
+                            "enable_mtp_adaptive_hf_exact_canonical_q_banding": bool(
+                                getattr(
+                                    self.server_args,
+                                    "enable_mtp_adaptive_hf_exact_canonical_q_banding",
+                                    False,
+                                )
+                            ),
+                            "mtp_adaptive_canonical_q_lens": list(
+                                getattr(
+                                    self.server_args,
+                                    "mtp_adaptive_canonical_q_lens",
                                     [],
                                 )
                             ),

@@ -508,7 +508,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     )
     freed_by_tail_cleanup: set[int] = set()
     freed_by_overalloc_range: set[int] = set()
+    freed_by_terminal_gap_cleanup: set[int] = set()
     retained_as_committed: set[int] = set()
+    retained_as_cached: set[int] = set()
     seed_anchor_old_loc: int | None = (
         int(req.mtp_seed_anchor_old_last_loc)
         if mtp_kv_leak_debug
@@ -602,6 +604,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         retained_as_committed = curr_step_tokens.intersection(
             _tensor_to_int_set(committed_slice)
         )
+        if hasattr(tree_cache, "all_values_flatten"):
+            cached_values = tree_cache.all_values_flatten()
+            if isinstance(cached_values, torch.Tensor) and cached_values.numel() > 0:
+                retained_as_cached = curr_step_tokens.intersection(
+                    _tensor_to_int_set(cached_values)
+                )
 
     start_p, end_p = req.pop_overallocated_kv_cache()
 
@@ -658,8 +666,29 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         missing_from_terminal_release = curr_step_tokens.difference(
             freed_by_tail_cleanup
             | freed_by_overalloc_range
+            | freed_by_terminal_gap_cleanup
             | retained_as_committed
+            | retained_as_cached
         )
+        if missing_from_terminal_release:
+            # Canonical-q banding can commit from a non-prefix slice. If one terminal-step
+            # slot remains unowned after normal tail + overalloc cleanup, release it here
+            # so KV ownership cannot leak across requests.
+            missing_ids = sorted(missing_from_terminal_release)
+            missing_tensor = torch.tensor(
+                missing_ids,
+                dtype=torch.int64,
+                device=tree_cache.req_to_token_pool.req_to_token.device,
+            )
+            tree_cache.token_to_kv_pool_allocator.free(missing_tensor)
+            freed_by_terminal_gap_cleanup.update(missing_ids)
+            missing_from_terminal_release = curr_step_tokens.difference(
+                freed_by_tail_cleanup
+                | freed_by_overalloc_range
+                | freed_by_terminal_gap_cleanup
+                | retained_as_committed
+                | retained_as_cached
+            )
         if missing_from_terminal_release:
             raise ValueError(
                 "MTP terminal release ownership gap detected. "
@@ -688,7 +717,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             f"curr_step_token_count={len(curr_step_tokens)}, "
             f"freed_by_tail_cleanup_count={len(freed_by_tail_cleanup)}, "
             f"freed_by_overalloc_range_count={len(freed_by_overalloc_range)}, "
+            f"freed_by_terminal_gap_cleanup_count={len(freed_by_terminal_gap_cleanup)}, "
             f"retained_as_committed_count={len(retained_as_committed)}, "
+            f"retained_as_cached_count={len(retained_as_cached)}, "
             f"missing_from_terminal_release_count={len(missing_from_terminal_release)}, "
             f"missing_from_terminal_release_sample="
             f"{sorted(missing_from_terminal_release)[:16]}, "

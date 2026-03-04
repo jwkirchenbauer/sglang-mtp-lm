@@ -16,6 +16,13 @@ python3 scripts/playground/mtp_cudagraph_ab.py \
   --candidate-url http://127.0.0.1:30001 \
   --include-conf-adapt
 
+# 3b) Require conf_adapt+hf_exact q>1 graph usage on candidate
+python3 scripts/playground/mtp_cudagraph_ab.py \
+  --baseline-url http://127.0.0.1:30000 \
+  --candidate-url http://127.0.0.1:30001 \
+  --include-conf-adapt \
+  --expect-conf-adapt-hf-exact-qgt1-graph
+
 # 4) Single-GPU sequential workflow:
 #    a) run baseline server, then:
 python3 scripts/playground/mtp_cudagraph_ab.py \
@@ -55,6 +62,8 @@ TRACE_FIELDS = [
     "a_prev_runtime",
     "attempt_k_runtime",
     "recompute_len_runtime",
+    "canonical_q_len",
+    "canonical_q_banding_applied",
     "commit_start_runtime",
     "commit_len_runtime",
     "decode_k_for_step_runtime",
@@ -122,15 +131,10 @@ def build_scenarios(
     if include_conf_adapt:
         for mode in conf_adapt_window_modes:
             normalized_mode = mode.strip().lower()
-            if normalized_mode == "fixed_window":
-                raise ValueError(
-                    "conf_adapt fixed_window scenarios are disabled in Phase 2C.1 "
-                    "pending KV ownership-ordering fixes."
-                )
             if normalized_mode != "hf_exact":
                 raise ValueError(
                     f"Unsupported conf-adapt window mode: {mode!r}. "
-                    "Expected 'hf_exact' for Phase 2C.1."
+                    "Expected 'hf_exact'."
                 )
             scenarios.append(
                 Scenario(
@@ -205,6 +209,7 @@ def find_trace_issues(
     trace: List[Dict[str, Any]],
     scenario: Scenario,
     expect_q_gt1_graph: bool,
+    expect_conf_adapt_hf_exact_qgt1_graph: bool = False,
 ) -> List[str]:
     issues = []
     if trace is None:
@@ -279,35 +284,28 @@ def find_trace_issues(
                     if (
                         recompute_len is not None
                         and a_prev is not None
-                        and int(recompute_len) != int(a_prev)
+                        and int(recompute_len) < int(a_prev)
                     ):
                         issues.append(
-                            f"hf_exact_recompute_mismatch_at_step_{idx}_recompute_{recompute_len}_a_prev_{a_prev}"
+                            f"hf_exact_recompute_lt_a_prev_at_step_{idx}_recompute_{recompute_len}_a_prev_{a_prev}"
                         )
-                    if q_runtime is not None and a_prev is not None:
-                        expected_q = int(a_prev) + int(scenario.k_max) - 1
+                    if (
+                        commit_start is not None
+                        and recompute_len is not None
+                        and a_prev is not None
+                    ):
+                        expected_commit_start = int(recompute_len) - int(a_prev)
+                        if int(commit_start) != expected_commit_start:
+                            issues.append(
+                                "hf_exact_commit_start_mismatch_at_step_"
+                                f"{idx}_expected_{expected_commit_start}_got_{commit_start}"
+                            )
+                    if q_runtime is not None and recompute_len is not None:
+                        expected_q = int(recompute_len) + int(scenario.k_max) - 1
                         if int(q_runtime) != expected_q:
                             issues.append(
                                 f"hf_exact_q_mismatch_at_step_{idx}_expected_{expected_q}_got_{q_runtime}"
                             )
-                elif scenario.adaptive_window_mode == "fixed_window":
-                    expected_q = 2 * int(scenario.k_max) - 1
-                    if int(q_runtime) != expected_q:
-                        issues.append(
-                            f"fixed_window_q_mismatch_at_step_{idx}_expected_{expected_q}_got_{q_runtime}"
-                        )
-                    if recompute_len is not None and int(recompute_len) != int(scenario.k_max):
-                        issues.append(
-                            f"fixed_window_recompute_mismatch_at_step_{idx}_expected_{scenario.k_max}_got_{recompute_len}"
-                        )
-                    if (
-                        commit_start is not None
-                        and a_prev is not None
-                        and int(commit_start) != int(scenario.k_max) - int(a_prev)
-                    ):
-                        issues.append(
-                            f"fixed_window_commit_start_mismatch_at_step_{idx}_expected_{int(scenario.k_max)-int(a_prev)}_got_{commit_start}"
-                        )
 
     if expect_q_gt1_graph and not scenario.is_conf_adapt and scenario.expected_seed_q > 1:
         for idx, row in enumerate(trace):
@@ -319,26 +317,27 @@ def find_trace_issues(
 
     if scenario.is_conf_adapt:
         if scenario.adaptive_window_mode == "hf_exact":
-            for idx, row in enumerate(trace):
-                if row is None:
-                    continue
-                q_runtime = row.get("decode_q_len_per_req_runtime")
-                can_graph = row.get("can_run_cuda_graph")
-                if q_runtime is not None and int(q_runtime) > 1 and can_graph is True:
-                    issues.append(f"conf_adapt_hf_exact_q_gt1_used_graph_at_step_{idx}")
-                    break
-        elif scenario.adaptive_window_mode == "fixed_window" and expect_q_gt1_graph:
-            for idx, row in enumerate(trace):
-                if row is None:
-                    continue
-                q_runtime = row.get("decode_q_len_per_req_runtime")
-                if q_runtime is not None and int(q_runtime) > 1:
-                    if row.get("can_run_cuda_graph") is not True:
-                        issues.append(
-                            f"conf_adapt_fixed_window_q_gt1_graph_not_enabled_at_step_{idx}"
-                        )
+            if expect_conf_adapt_hf_exact_qgt1_graph:
+                for idx, row in enumerate(trace):
+                    if row is None:
+                        continue
+                    q_runtime = row.get("decode_q_len_per_req_runtime")
+                    can_graph = row.get("can_run_cuda_graph")
+                    if q_runtime is not None and int(q_runtime) > 1:
+                        if can_graph is not True:
+                            issues.append(
+                                f"conf_adapt_hf_exact_q_gt1_graph_not_enabled_at_step_{idx}"
+                            )
+                            break
+            else:
+                for idx, row in enumerate(trace):
+                    if row is None:
+                        continue
+                    q_runtime = row.get("decode_q_len_per_req_runtime")
+                    can_graph = row.get("can_run_cuda_graph")
+                    if q_runtime is not None and int(q_runtime) > 1 and can_graph is True:
+                        issues.append(f"conf_adapt_hf_exact_q_gt1_used_graph_at_step_{idx}")
                         break
-
     return issues
 
 
@@ -405,6 +404,7 @@ def run_suite(
     scenarios: List[Scenario],
     timeout_s: int,
     expect_q_gt1_graph: bool,
+    expect_conf_adapt_hf_exact_qgt1_graph: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
     for scenario in scenarios:
@@ -416,6 +416,7 @@ def run_suite(
             trace=trace,
             scenario=scenario,
             expect_q_gt1_graph=expect_q_gt1_graph,
+            expect_conf_adapt_hf_exact_qgt1_graph=expect_conf_adapt_hf_exact_qgt1_graph,
         )
         results[scenario.name] = {
             "scenario": scenario.name,
@@ -528,12 +529,17 @@ def parse_args():
         type=str,
         nargs="+",
         default=["hf_exact"],
-        help="Adaptive window modes to include in conf_adapt scenarios (Phase 2C.1: hf_exact only).",
+        help="Adaptive window modes to include in conf_adapt scenarios (hf_exact only).",
     )
     parser.add_argument(
         "--allow-qgt1-eager",
         action="store_true",
         help="Allow q>1 static scenarios to run eagerly (do not require can_run_cuda_graph=true).",
+    )
+    parser.add_argument(
+        "--expect-conf-adapt-hf-exact-qgt1-graph",
+        action="store_true",
+        help="Require conf_adapt+hf_exact steps with q_len>1 to run with can_run_cuda_graph=true.",
     )
     parser.add_argument(
         "--strict",
@@ -578,6 +584,9 @@ def main():
         conf_adapt_window_modes=list(args.conf_adapt_window_modes),
     )
     expect_qgt1_graph = not bool(args.allow_qgt1_eager)
+    expect_conf_adapt_hf_exact_qgt1_graph = bool(
+        args.expect_conf_adapt_hf_exact_qgt1_graph
+    )
 
     report: Dict[str, Any] = {"scenarios": [s.name for s in scenarios]}
     exit_code = 0
@@ -589,6 +598,7 @@ def main():
             scenarios=scenarios,
             timeout_s=args.timeout,
             expect_q_gt1_graph=expect_qgt1_graph,
+            expect_conf_adapt_hf_exact_qgt1_graph=expect_conf_adapt_hf_exact_qgt1_graph,
         )
         print_single_endpoint_summary(args.url, suite)
         report["mode"] = "single"
@@ -606,6 +616,7 @@ def main():
             scenarios=scenarios,
             timeout_s=args.timeout,
             expect_q_gt1_graph=False,
+            expect_conf_adapt_hf_exact_qgt1_graph=False,
         )
         candidate_suite = run_suite(
             url=args.candidate_url,
@@ -613,6 +624,7 @@ def main():
             scenarios=scenarios,
             timeout_s=args.timeout,
             expect_q_gt1_graph=expect_qgt1_graph,
+            expect_conf_adapt_hf_exact_qgt1_graph=expect_conf_adapt_hf_exact_qgt1_graph,
         )
         failures = print_ab_summary(
             baseline_url=args.baseline_url,

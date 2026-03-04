@@ -130,12 +130,12 @@ class SamplingParams:
             self.mtp_adaptive_window_mode = self.mtp_adaptive_window_mode.strip().lower()
         else:
             raise ValueError(
-                "mtp_adaptive_window_mode must be a string in {'hf_exact', 'fixed_window'}."
+                "mtp_adaptive_window_mode must be the string 'hf_exact'."
             )
-        if self.mtp_adaptive_window_mode not in {"hf_exact", "fixed_window"}:
+        if self.mtp_adaptive_window_mode != "hf_exact":
             raise ValueError(
-                "Unsupported mtp_adaptive_window_mode. Expected one of "
-                "{'hf_exact', 'fixed_window'}, got "
+                "Unsupported mtp_adaptive_window_mode. Expected "
+                "'hf_exact', got "
                 f"{self.mtp_adaptive_window_mode!r}."
             )
 
@@ -312,11 +312,6 @@ class SamplingParams:
                 )
         if self.mtp_strategy_kind is not None and not self.mtp_enabled:
             raise ValueError("mtp_strategy requires mtp_enabled=true.")
-        if self.mtp_adaptive_window_mode == "fixed_window":
-            raise ValueError(
-                "mtp_adaptive_window_mode='fixed_window' is temporarily disabled in Phase 2C.1 "
-                "pending the KV ownership-ordering fix for non-prefix committed slices."
-            )
 
         grammars = [
             self.json_schema,

@@ -906,7 +906,52 @@ class Req(ReqDllmMixin):
         mode = getattr(self.sampling_params, "mtp_adaptive_window_mode", "hf_exact")
         if isinstance(mode, str):
             mode = mode.strip().lower()
-        return "fixed_window" if mode == "fixed_window" else "hf_exact"
+        if mode != "hf_exact":
+            raise ValueError(
+                "Only mtp_adaptive_window_mode='hf_exact' is supported. "
+                f"Got {mode!r} for request {self.rid}."
+            )
+        return "hf_exact"
+
+    def mtp_select_canonical_q_len_for_step(
+        self,
+        *,
+        base_q_len: int,
+        k_max: int,
+        phase_for_step: str,
+        available_context_len: int,
+    ) -> Optional[int]:
+        if phase_for_step == "seed" or not self.mtp_is_conf_adapt():
+            return None
+
+        server_args = get_global_server_args()
+        if not bool(
+            getattr(
+                server_args,
+                "enable_mtp_adaptive_hf_exact_canonical_q_banding",
+                False,
+            )
+        ):
+            return None
+
+        canonical_q_lens = list(
+            getattr(server_args, "mtp_adaptive_canonical_q_lens", []) or []
+        )
+        if len(canonical_q_lens) == 0:
+            return None
+
+        upper_q_bound = 2 * int(k_max) - 1
+        upper_q_bound_by_context = int(available_context_len) + int(k_max) - 1
+        max_feasible_q = min(upper_q_bound, upper_q_bound_by_context)
+        candidates = [
+            int(q)
+            for q in canonical_q_lens
+            if int(base_q_len) <= int(q) <= int(max_feasible_q)
+        ]
+        if len(candidates) == 0:
+            return None
+
+        return min(candidates)
 
     def mtp_phase_for_step(self) -> str:
         if self.mtp_overlap_next_phase is not None:
@@ -965,6 +1010,8 @@ class Req(ReqDllmMixin):
             recompute_len = 1
             commit_start = 0
             commit_len = 1
+            canonical_q_len = None
+            canonical_q_banding_applied = False
         else:
             pending_tokens_for_step = self.mtp_pending_tokens_for_step()
             a_prev = len(pending_tokens_for_step)
@@ -980,27 +1027,52 @@ class Req(ReqDllmMixin):
                     f"rid={self.rid}, pending_len={a_prev}, mtp_k={attempt_k}."
                 )
 
-            recompute_len = (
-                a_prev if (self.mtp_is_conf_adapt() and mode == "hf_exact") else attempt_k
-            )
+            recompute_len = a_prev if self.mtp_is_conf_adapt() else attempt_k
             commit_len = a_prev
-            commit_start = (
-                attempt_k - a_prev
-                if (self.mtp_is_conf_adapt() and mode == "fixed_window")
-                else 0
-            )
-            if self.mtp_is_conf_adapt() and mode == "hf_exact":
-                if commit_start != 0:
+            commit_start = 0
+            canonical_q_len = None
+            canonical_q_banding_applied = False
+            if self.mtp_is_conf_adapt():
+                base_q_len = recompute_len + attempt_k - 1
+                available_context_len = (
+                    len(self.origin_input_ids) + len(self.output_ids) + a_prev
+                )
+                canonical_q_len = self.mtp_select_canonical_q_len_for_step(
+                    base_q_len=base_q_len,
+                    k_max=attempt_k,
+                    phase_for_step=phase_for_step,
+                    available_context_len=available_context_len,
+                )
+                if canonical_q_len is not None and int(canonical_q_len) != int(base_q_len):
+                    recompute_len = int(canonical_q_len) - attempt_k + 1
+                    if recompute_len < a_prev:
+                        raise ValueError(
+                            "Canonical q-len mapping selected an invalid recompute length. "
+                            f"rid={self.rid}, recompute_len={recompute_len}, a_prev={a_prev}, "
+                            f"base_q_len={base_q_len}, canonical_q_len={canonical_q_len}, k_max={attempt_k}."
+                        )
+                    commit_start = recompute_len - a_prev
+                    canonical_q_banding_applied = True
+
+            if self.mtp_is_conf_adapt():
+                if recompute_len < a_prev:
                     raise ValueError(
-                        "hf_exact steady step must commit from prefix region (commit_start == 0). "
-                        f"rid={self.rid}, phase={phase_for_step}, commit_start={commit_start}, "
-                        f"a_prev={a_prev}, k_max={attempt_k}."
+                        "conf_adapt steady step requires recompute_len >= a_prev. "
+                        f"rid={self.rid}, recompute_len={recompute_len}, a_prev={a_prev}, "
+                        f"phase={phase_for_step}, mode={mode}."
+                    )
+                expected_commit_start = recompute_len - a_prev
+                if commit_start != expected_commit_start:
+                    raise ValueError(
+                        "conf_adapt steady step requires commit_start == recompute_len - a_prev. "
+                        f"rid={self.rid}, commit_start={commit_start}, expected={expected_commit_start}, "
+                        f"recompute_len={recompute_len}, a_prev={a_prev}, phase={phase_for_step}."
                     )
                 if commit_len != a_prev:
                     raise ValueError(
-                        "hf_exact steady step must commit exactly a_prev tokens. "
-                        f"rid={self.rid}, phase={phase_for_step}, commit_len={commit_len}, "
-                        f"a_prev={a_prev}, k_max={attempt_k}."
+                        "conf_adapt steady step requires commit_len == a_prev. "
+                        f"rid={self.rid}, commit_len={commit_len}, a_prev={a_prev}, "
+                        f"phase={phase_for_step}."
                     )
 
         q_len = recompute_len + attempt_k - 1
@@ -1026,6 +1098,8 @@ class Req(ReqDllmMixin):
             "emit_len": emit_len,
             "commit_start": commit_start,
             "commit_len": commit_len,
+            "canonical_q_len": canonical_q_len,
+            "canonical_q_banding_applied": canonical_q_banding_applied,
         }
 
     def mtp_attempt_k_for_step(self) -> int:
@@ -2641,6 +2715,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 commit_len = int(step_layout["commit_len"])
                 a_prev = int(step_layout["a_prev"])
                 mode_for_step = str(step_layout["window_mode"])
+                canonical_q_banding_applied = bool(
+                    step_layout.get("canonical_q_banding_applied", False)
+                )
                 pending_tokens_for_step = req.mtp_pending_tokens_for_step()
                 req.mtp_commit_len = commit_len
                 req.mtp_step_recompute_len = recompute_len
@@ -2648,15 +2725,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.mtp_step_commit_start = commit_start
                 req.mtp_step_commit_len = commit_len
                 if req.mtp_strategy_kind == "conf_adapt" and phase_for_step != "seed":
-                    if mode_for_step == "hf_exact" and commit_start != 0:
+                    expected_commit_start = recompute_len - a_prev
+                    if recompute_len < a_prev:
                         raise ValueError(
-                            "hf_exact steady step requires commit_start == 0 before decode row build. "
-                            f"rid={req.rid}, commit_start={commit_start}, a_prev={a_prev}, "
-                            f"q_len={token_per_req}."
+                            "conf_adapt steady step requires recompute_len >= a_prev before decode row build. "
+                            f"rid={req.rid}, recompute_len={recompute_len}, a_prev={a_prev}, "
+                            f"mode={mode_for_step}, q_len={token_per_req}."
+                        )
+                    if commit_start != expected_commit_start:
+                        raise ValueError(
+                            "conf_adapt steady step requires commit_start == recompute_len - a_prev before decode row build. "
+                            f"rid={req.rid}, commit_start={commit_start}, expected={expected_commit_start}, "
+                            f"recompute_len={recompute_len}, a_prev={a_prev}, q_len={token_per_req}."
                         )
                     if commit_len != a_prev:
                         raise ValueError(
-                            "Adaptive steady step requires commit_len == a_prev before decode row build. "
+                            "conf_adapt steady step requires commit_len == a_prev before decode row build. "
                             f"rid={req.rid}, commit_len={commit_len}, a_prev={a_prev}, "
                             f"mode={mode_for_step}, q_len={token_per_req}."
                         )
@@ -2733,6 +2817,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     {
                         "phase": phase_for_step,
                         "adaptive_window_mode": mode_for_step,
+                        "canonical_q_banding_applied": canonical_q_banding_applied,
+                        "canonical_q_len": step_layout.get("canonical_q_len"),
                         "strategy_kind": req.mtp_strategy_kind,
                         "a_prev": int(a_prev),
                         "attempt_k_for_step": int(attempt_k),

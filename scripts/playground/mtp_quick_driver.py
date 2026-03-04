@@ -7,6 +7,7 @@ debug loops before running full lm_eval acceptance.
 
 import argparse
 import json
+import math
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -67,9 +68,10 @@ def build_sampling_params(args: argparse.Namespace) -> Dict[str, Any]:
         "mtp_enabled": True,
         "mtp_k": int(args.mtp_k),
         "mtp_mask_id": int(args.mtp_mask_id),
-        "mtp_strategy": ["conf_adapt", float(args.conf_threshold)],
-        "mtp_adaptive_window_mode": str(args.adaptive_window_mode),
     }
+    if str(args.mtp_strategy_kind) == "conf_adapt":
+        params["mtp_strategy"] = ["conf_adapt", float(args.conf_threshold)]
+        params["mtp_adaptive_window_mode"] = str(args.adaptive_window_mode)
     if args.stop:
         params["stop"] = list(args.stop)
     return params
@@ -124,6 +126,24 @@ def post_one(
         }
 
 
+def _extract_completion_tokens(row: Dict[str, Any]) -> int:
+    meta_info = row.get("meta_info")
+    if not isinstance(meta_info, dict):
+        return 0
+    completion_tokens = meta_info.get("completion_tokens")
+    if isinstance(completion_tokens, (int, float)):
+        return max(0, int(completion_tokens))
+    return 0
+
+
+def _percentile_from_sorted(sorted_values: List[float], percentile: float) -> float:
+    if len(sorted_values) == 0:
+        raise ValueError("percentile requires non-empty input")
+    rank = max(0, math.ceil(percentile * len(sorted_values)) - 1)
+    rank = min(rank, len(sorted_values) - 1)
+    return float(sorted_values[rank])
+
+
 def run_endpoint(
     *,
     label: str,
@@ -134,6 +154,7 @@ def run_endpoint(
     timeout_s: float,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    wall_time_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=max(1, int(num_concurrent))) as pool:
         futures = {
             pool.submit(
@@ -150,18 +171,30 @@ def run_endpoint(
         for future in as_completed(futures):
             rows.append(future.result())
     rows.sort(key=lambda x: int(x["idx"]))
+    wall_time_s = time.perf_counter() - wall_time_start
 
     ok_rows = [x for x in rows if bool(x.get("ok"))]
+    latencies = sorted([float(x["latency_s"]) for x in ok_rows])
+    total_completion_tokens = int(sum(_extract_completion_tokens(x) for x in ok_rows))
     summary = {
         "label": label,
         "url": url,
         "num_requests": len(rows),
         "num_ok": len(ok_rows),
         "num_failed": len(rows) - len(ok_rows),
+        "wall_time_s": float(wall_time_s),
         "p50_latency_s": (
-            sorted([float(x["latency_s"]) for x in ok_rows])[len(ok_rows) // 2]
-            if ok_rows
-            else None
+            _percentile_from_sorted(latencies, 0.50) if len(latencies) > 0 else None
+        ),
+        "p95_latency_s": (
+            _percentile_from_sorted(latencies, 0.95) if len(latencies) > 0 else None
+        ),
+        "mean_latency_s": (
+            float(sum(latencies) / len(latencies)) if len(latencies) > 0 else None
+        ),
+        "total_completion_tokens": total_completion_tokens,
+        "completion_tokens_per_s": (
+            float(total_completion_tokens / wall_time_s) if wall_time_s > 0 else None
         ),
     }
     return rows, summary
@@ -215,6 +248,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--mtp-k", type=int, default=8)
+    parser.add_argument(
+        "--mtp-strategy-kind",
+        type=str,
+        choices=["conf_adapt", "static"],
+        default="conf_adapt",
+    )
     parser.add_argument("--conf-threshold", type=float, default=0.9)
     parser.add_argument("--adaptive-window-mode", type=str, default="hf_exact")
     parser.add_argument("--mtp-mask-id", type=int, default=128259)

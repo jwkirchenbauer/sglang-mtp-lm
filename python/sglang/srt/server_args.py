@@ -583,6 +583,10 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     enable_mtp_static_q_len_cuda_graph: bool = False
     mtp_static_cuda_graph_k_list: Optional[List[int]] = None
+    enable_mtp_adaptive_hf_exact_q_len_cuda_graph: bool = False
+    mtp_adaptive_cuda_graph_kmax_list: Optional[List[int]] = None
+    enable_mtp_adaptive_hf_exact_canonical_q_banding: bool = False
+    mtp_adaptive_canonical_q_lens: Optional[List[int]] = None
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -2888,12 +2892,36 @@ class ServerArgs:
         if self.mtp_static_cuda_graph_k_list is None:
             self.mtp_static_cuda_graph_k_list = []
         else:
-            normalized_k_list = sorted({int(k) for k in self.mtp_static_cuda_graph_k_list})
+            normalized_k_list = sorted(
+                {int(k) for k in self.mtp_static_cuda_graph_k_list}
+            )
             if any(k <= 0 for k in normalized_k_list):
                 raise ValueError(
                     "mtp_static_cuda_graph_k_list must contain positive integers only."
                 )
             self.mtp_static_cuda_graph_k_list = normalized_k_list
+        if self.mtp_adaptive_cuda_graph_kmax_list is None:
+            self.mtp_adaptive_cuda_graph_kmax_list = []
+        else:
+            normalized_kmax_list = sorted(
+                {int(k) for k in self.mtp_adaptive_cuda_graph_kmax_list}
+            )
+            if any(k <= 0 for k in normalized_kmax_list):
+                raise ValueError(
+                    "mtp_adaptive_cuda_graph_kmax_list must contain positive integers only."
+                )
+            self.mtp_adaptive_cuda_graph_kmax_list = normalized_kmax_list
+        if self.mtp_adaptive_canonical_q_lens is None:
+            self.mtp_adaptive_canonical_q_lens = []
+        else:
+            normalized_canonical_q_lens = sorted(
+                {int(q) for q in self.mtp_adaptive_canonical_q_lens}
+            )
+            if any(q <= 0 for q in normalized_canonical_q_lens):
+                raise ValueError(
+                    "mtp_adaptive_canonical_q_lens must contain positive integers only."
+                )
+            self.mtp_adaptive_canonical_q_lens = normalized_canonical_q_lens
 
         if (
             self.enable_mtp_static_q_len_cuda_graph
@@ -2910,6 +2938,38 @@ class ServerArgs:
             logger.warning(
                 "mtp_static_cuda_graph_k_list is set but enable_mtp_static_q_len_cuda_graph is false. "
                 "Ignoring static q_len>1 cuda graph pre-capture."
+            )
+        if (
+            self.enable_mtp_adaptive_hf_exact_q_len_cuda_graph
+            and len(self.mtp_adaptive_cuda_graph_kmax_list) == 0
+        ):
+            logger.warning(
+                "enable_mtp_adaptive_hf_exact_q_len_cuda_graph is set but mtp_adaptive_cuda_graph_kmax_list is empty. "
+                "conf_adapt+hf_exact q_len>1 decode will stay eager."
+            )
+        if (
+            not self.enable_mtp_adaptive_hf_exact_q_len_cuda_graph
+            and len(self.mtp_adaptive_cuda_graph_kmax_list) > 0
+        ):
+            logger.warning(
+                "mtp_adaptive_cuda_graph_kmax_list is set but enable_mtp_adaptive_hf_exact_q_len_cuda_graph is false. "
+                "Ignoring adaptive hf_exact q_len>1 cuda graph pre-capture."
+            )
+        if (
+            self.enable_mtp_adaptive_hf_exact_canonical_q_banding
+            and len(self.mtp_adaptive_canonical_q_lens) == 0
+        ):
+            logger.warning(
+                "enable_mtp_adaptive_hf_exact_canonical_q_banding is set but mtp_adaptive_canonical_q_lens is empty. "
+                "Adaptive decode will use per-request hf_exact q_len without canonical banding."
+            )
+        if (
+            not self.enable_mtp_adaptive_hf_exact_canonical_q_banding
+            and len(self.mtp_adaptive_canonical_q_lens) > 0
+        ):
+            logger.warning(
+                "mtp_adaptive_canonical_q_lens is set but enable_mtp_adaptive_hf_exact_canonical_q_banding is false. "
+                "Ignoring canonical q-len banding configuration."
             )
 
     def _handle_debug_utils(self):
@@ -4538,6 +4598,30 @@ class ServerArgs:
             nargs="+",
             default=ServerArgs.mtp_static_cuda_graph_k_list,
             help="Experimental: explicit static MTP k values for q_len>1 pre-capture. Captures seed q=k and steady q=2k-1 for each k.",
+        )
+        parser.add_argument(
+            "--enable-mtp-adaptive-hf-exact-q-len-cuda-graph",
+            action="store_true",
+            help="Experimental: enable q_len>1 CUDA graph replay for conf_adapt+hf_exact decode, using only pre-captured q-lens.",
+        )
+        parser.add_argument(
+            "--mtp-adaptive-cuda-graph-kmax-list",
+            type=int,
+            nargs="+",
+            default=ServerArgs.mtp_adaptive_cuda_graph_kmax_list,
+            help="Experimental: explicit conf_adapt k_max values for q_len>1 pre-capture. Captures hf_exact steady-state q_len range [k_max, 2*k_max-1] for each k_max.",
+        )
+        parser.add_argument(
+            "--enable-mtp-adaptive-hf-exact-canonical-q-banding",
+            action="store_true",
+            help="Experimental: enable canonical q-len banding for conf_adapt+hf_exact steady decode. Each request q_len is rounded up to the nearest configured canonical q-len.",
+        )
+        parser.add_argument(
+            "--mtp-adaptive-canonical-q-lens",
+            type=int,
+            nargs="+",
+            default=ServerArgs.mtp_adaptive_canonical_q_lens,
+            help="Experimental: canonical q-lens used by adaptive hf_exact banding. For each request, choose the smallest canonical q >= request q (bounded by k_max).",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",

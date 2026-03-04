@@ -583,18 +583,23 @@ class SchedulerOutputProcessorMixin:
                             f"rid={req.rid}, commit_len={commit_len_this_step}, a_prev={a_prev_this_step}, "
                             f"phase={phase_for_step}."
                         )
-                    if (
-                        phase_for_step != "seed"
-                        and req.mtp_strategy_kind == "conf_adapt"
-                        and str(getattr(batch, "mtp_adaptive_window_mode", "hf_exact"))
-                        == "hf_exact"
-                        and commit_start_this_step != 0
-                    ):
-                        raise ValueError(
-                            "hf_exact steady-step commit must start at prefix (commit_start == 0). "
-                            f"rid={req.rid}, commit_start={commit_start_this_step}, "
-                            f"a_prev={a_prev_this_step}, q_len={req_q_len}."
+                    if phase_for_step != "seed" and req.mtp_strategy_kind == "conf_adapt":
+                        expected_commit_start = (
+                            int(recompute_len_this_step) - int(a_prev_this_step)
                         )
+                        if int(recompute_len_this_step) < int(a_prev_this_step):
+                            raise ValueError(
+                                "conf_adapt steady-step requires recompute_len >= a_prev in output processing. "
+                                f"rid={req.rid}, recompute_len={recompute_len_this_step}, "
+                                f"a_prev={a_prev_this_step}, q_len={req_q_len}."
+                            )
+                        if int(commit_start_this_step) != int(expected_commit_start):
+                            raise ValueError(
+                                "conf_adapt steady-step requires commit_start == recompute_len - a_prev in output processing. "
+                                f"rid={req.rid}, commit_start={commit_start_this_step}, "
+                                f"expected={expected_commit_start}, recompute_len={recompute_len_this_step}, "
+                                f"a_prev={a_prev_this_step}, q_len={req_q_len}."
+                            )
 
                     effective_k_this_step = (
                         int(mtp_effective_k_per_req[i])
