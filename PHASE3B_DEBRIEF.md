@@ -54,6 +54,70 @@ All script validation was run in interactive shells with `sslm_sgl_env` as the f
 | non-MTP | 64 | non_mtp_c64 | 3738.93 | 1.000 | 0.5703 |
 | non-MTP | 128 | non_mtp_c128 | 10301.44 | 1.000 | 0.6094 |
 
+## Optimization Diff Analysis (`b7c25c257`)
+Relative to the pre-phase3B state (`fa0d763d2`), the optimization changes in the decode hot path were:
+
+1. Per-request MTP step-layout cache in `Req`:
+   - Added `_mtp_step_layout_cache_key/_value` and keyed caching inside `mtp_step_layout_for_step`.
+   - Cache key captures phase/mode/k/strategy/a_prev/context lengths/canonical settings.
+   - This removes repeated layout recomputation during the same decode step.
+2. Batch-level reuse of already-computed layouts in `ScheduleBatch.prepare_for_decode`:
+   - `mtp_step_layouts = [req.mtp_step_layout_for_step() for req in mtp_enabled_reqs]`
+   - Reused for recompute/q-len/commit arrays and mask-row build loop.
+   - This eliminates repeated per-req layout calls and duplicate emit-window computation in the inner loop.
+3. Debug-trace gating in decode hot paths:
+   - `req.mtp_debug_upsert_step(...)` payload construction now runs only when `req.mtp_debug_trace_enabled`.
+   - Sampling debug attachment now also respects `req.mtp_debug_trace_enabled`.
+   - KV leak committed-region extraction now runs only under `SGLANG_MTP_KV_LEAK_DEBUG`.
+4. Measurement provenance hardening:
+   - Added `--disable-mtp` in `mtp_quick_driver.py` to omit all `mtp_*` request fields for true non-MTP runs.
+
+These are compatibility-preserving optimizations: no `k=1` fork or non-MTP shortcut was introduced in scheduler logic.
+
+## Phase 3A Problem-Statement Closure Analysis
+Reference problem statements: `PHASE3A_DEBRIEF.md` (Problems 1-3).
+
+### Problem 1: Static `k=3` high-concurrency edge collapse
+Status: **partially improved, not solved**.
+
+1. Improvement at low/medium concurrency is strong:
+   - `k=3` vs non-MTP peak ratio:
+     - `c=32`: `2.020`
+     - `c=64`: `1.767`
+2. Collapse remains at higher concurrency:
+   - `c=128`: `0.787` (`k=3` falls behind non-MTP).
+3. Interpretation:
+   - The phase3B hot-path cleanup reduced fixed scheduler overhead enough to sustain the `k=3` edge through `c=64`.
+   - It did not remove the high-concurrency bottleneck regime.
+
+### Problem 2: MTP `k=1` systematic gap vs non-MTP
+Status: **substantially improved, residual high-concurrency regression remains**.
+
+1. Representative parity goal (MTP machinery on, `k=1`) improved materially:
+   - `c=1`: `k=1` vs non-MTP = `0.999` (near exact parity).
+   - `c=32`: `1.312`
+   - `c=64`: `1.510`
+2. Remaining gap at top tested concurrency:
+   - `c=128`: `0.745`.
+3. Interpretation:
+   - The layout-caching + debug-gating changes directly target non-scaling MTP host overhead and appear to have worked for `c<=64`.
+   - A separate scaling bottleneck still appears at `c=128`.
+
+### Problem 3: Adaptive inefficiency (`conf_adapt`)
+Status: **not solved**.
+
+1. Low-concurrency behavior is good:
+   - `conf_adapt_k3_t09` vs non-MTP at `c=1`: `2.321`
+   - `conf_adapt_k8_t09` vs non-MTP at `c=1`: `3.063`
+2. Medium/high concurrency remains far behind non-MTP and static `k=3`:
+   - `conf_adapt_k3_t09` vs non-MTP:
+     - `c=32`: `0.343`, `c=64`: `0.379`, `c=128`: `0.235`
+   - `conf_adapt_k8_t09` vs non-MTP:
+     - `c=32`: `0.314`, `c=64`: `0.257`, `c=128`: `0.151`
+3. Interpretation:
+   - Current changes were mostly scheduler-overhead reductions and measurement tooling.
+   - They did not address adaptive-specific occupancy/recompute/bucketing bottlenecks enough to produce concurrency scaling.
+
 ## Run Artifacts
 1. Baseline matrix root (`non-MTP`, `k=1,2,3`):
    - `/capstor/scratch/cscs/jkirchen/sglang-mtp-lm/outputs/phase3b_lmeval_c1_32_64_128_20260305_071400`
