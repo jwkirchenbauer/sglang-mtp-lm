@@ -644,7 +644,11 @@ class SchedulerOutputProcessorMixin:
             self._mamba_prefix_cache_update(req, batch, result, i)
 
             if is_mtp_req:
-                if mtp_sample_debug is not None and mtp_sample_debug[i] is not None:
+                if (
+                    req.mtp_debug_trace_enabled
+                    and mtp_sample_debug is not None
+                    and mtp_sample_debug[i] is not None
+                ):
                     sample_entry = mtp_sample_debug[i]
                     req.mtp_debug_upsert_step(
                         int(sample_entry.get("step_idx", debug_step_idx)),
@@ -676,8 +680,7 @@ class SchedulerOutputProcessorMixin:
                         },
                     )
                     if (
-                        getattr(req, "mtp_debug_trace_enabled", False)
-                        and debug_step_idx == 0
+                        debug_step_idx == 0
                         and not getattr(req, "mtp_debug_logged_first_argmax", False)
                     ):
                         input_ids = []
@@ -766,7 +769,7 @@ class SchedulerOutputProcessorMixin:
                 else:
                     req.mtp_prev_step_cache_loc = None
 
-                if curr_step_cache_loc is not None:
+                if curr_step_cache_loc is not None and envs.SGLANG_MTP_KV_LEAK_DEBUG.get():
                     committed_region = curr_step_cache_loc[
                         commit_start_this_step:commit_end_this_step
                     ]
@@ -804,37 +807,38 @@ class SchedulerOutputProcessorMixin:
                         "lifecycle_source=decode"
                     )
 
-                req.mtp_debug_upsert_step(
-                    debug_step_idx,
-                    {
-                        "can_run_cuda_graph": bool(can_run_cuda_graph),
-                        "phase_before_step": batch.mtp_phase,
-                        "decode_q_len_per_req_runtime": int(req_q_len),
-                        "adaptive_window_mode_runtime": str(
-                            getattr(batch, "mtp_adaptive_window_mode", "hf_exact")
-                        ),
-                        "a_prev_runtime": int(a_prev_this_step),
-                        "attempt_k_runtime": int(attempt_k_this_step),
-                        "recompute_len_runtime": int(recompute_len_this_step),
-                        "commit_start_runtime": int(commit_start_this_step),
-                        "commit_len_runtime": int(commit_len_this_step),
-                        "decode_k_for_step_runtime": int(decode_k_this_step),
-                        "effective_k_runtime": int(effective_k_this_step),
-                        "committed_appended_to_output_ids": req._mtp_debug_cap_token_ids(
-                            committed_ids_runtime
-                        ),
-                        "pending_saved_for_next_step": req._mtp_debug_cap_token_ids(
-                            req.mtp_pending_tokens
-                        ),
-                        "kv_committed_len_before": kv_committed_len_before,
-                        "kv_committed_len_after": int(req.kv_committed_len),
-                        "kv_allocated_len_before": kv_allocated_len_before,
-                        "kv_allocated_len_after": int(req.kv_allocated_len),
-                        "mtp_commit_len": int(req.mtp_commit_len),
-                        "seq_len_base_used_for_next_decode": int(req.kv_committed_len),
-                        "phase_after_step": req.mtp_phase,
-                    },
-                )
+                if req.mtp_debug_trace_enabled:
+                    req.mtp_debug_upsert_step(
+                        debug_step_idx,
+                        {
+                            "can_run_cuda_graph": bool(can_run_cuda_graph),
+                            "phase_before_step": batch.mtp_phase,
+                            "decode_q_len_per_req_runtime": int(req_q_len),
+                            "adaptive_window_mode_runtime": str(
+                                getattr(batch, "mtp_adaptive_window_mode", "hf_exact")
+                            ),
+                            "a_prev_runtime": int(a_prev_this_step),
+                            "attempt_k_runtime": int(attempt_k_this_step),
+                            "recompute_len_runtime": int(recompute_len_this_step),
+                            "commit_start_runtime": int(commit_start_this_step),
+                            "commit_len_runtime": int(commit_len_this_step),
+                            "decode_k_for_step_runtime": int(decode_k_this_step),
+                            "effective_k_runtime": int(effective_k_this_step),
+                            "committed_appended_to_output_ids": req._mtp_debug_cap_token_ids(
+                                committed_ids_runtime
+                            ),
+                            "pending_saved_for_next_step": req._mtp_debug_cap_token_ids(
+                                req.mtp_pending_tokens
+                            ),
+                            "kv_committed_len_before": kv_committed_len_before,
+                            "kv_committed_len_after": int(req.kv_committed_len),
+                            "kv_allocated_len_before": kv_allocated_len_before,
+                            "kv_allocated_len_after": int(req.kv_allocated_len),
+                            "mtp_commit_len": int(req.mtp_commit_len),
+                            "seq_len_base_used_for_next_decode": int(req.kv_committed_len),
+                            "phase_after_step": req.mtp_phase,
+                        },
+                    )
                 if envs.SGLANG_MTP_KV_LEAK_DEBUG.get():
                     req.mtp_debug_last_step_idx = int(processed_step_idx)
                     req.mtp_debug_last_phase = str(batch.mtp_phase)

@@ -65,10 +65,15 @@ def build_sampling_params(args: argparse.Namespace) -> Dict[str, Any]:
         "temperature": 0,
         "top_k": 1,
         "max_new_tokens": int(args.max_new_tokens),
-        "mtp_enabled": True,
-        "mtp_k": int(args.mtp_k),
-        "mtp_mask_id": int(args.mtp_mask_id),
     }
+    if args.disable_mtp:
+        if str(args.mtp_strategy_kind) != "static":
+            raise ValueError("disable_mtp cannot be combined with conf_adapt strategy.")
+        return params
+
+    params["mtp_enabled"] = True
+    params["mtp_k"] = int(args.mtp_k)
+    params["mtp_mask_id"] = int(args.mtp_mask_id)
     if str(args.mtp_strategy_kind) == "conf_adapt":
         params["mtp_strategy"] = ["conf_adapt", float(args.conf_threshold)]
         params["mtp_adaptive_window_mode"] = str(args.adaptive_window_mode)
@@ -247,6 +252,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-concurrent", type=int, default=8)
     parser.add_argument("--timeout-s", type=float, default=120.0)
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--disable-mtp",
+        action="store_true",
+        help="Send baseline non-MTP sampling params (omit all mtp_* fields).",
+    )
     parser.add_argument("--mtp-k", type=int, default=8)
     parser.add_argument(
         "--mtp-strategy-kind",

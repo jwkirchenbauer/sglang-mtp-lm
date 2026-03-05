@@ -606,6 +606,8 @@ class Req(ReqDllmMixin):
         self.mtp_debug_trace: List[Dict[str, Any]] = []
         self.mtp_debug_logged_first_argmax: bool = False
         self.mtp_strategy_kind: Optional[str] = None
+        self._mtp_step_layout_cache_key: Optional[Tuple[Any, ...]] = None
+        self._mtp_step_layout_cache_value: Optional[Dict[str, Any]] = None
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -1004,6 +1006,40 @@ class Req(ReqDllmMixin):
         mode = self.mtp_adaptive_window_mode_for_step()
         k_max = int(self.sampling_params.mtp_k)
         attempt_k = max(1, k_max)
+        pending_tokens_for_step = (
+            self.mtp_pending_tokens_for_step() if phase_for_step != "seed" else []
+        )
+        a_prev_probe = 1 if phase_for_step == "seed" else len(pending_tokens_for_step)
+        server_args = get_global_server_args()
+        canonical_enabled = bool(
+            getattr(
+                server_args,
+                "enable_mtp_adaptive_hf_exact_canonical_q_banding",
+                False,
+            )
+        )
+        canonical_q_lens = tuple(
+            int(q)
+            for q in (
+                getattr(server_args, "mtp_adaptive_canonical_q_lens", None) or []
+            )
+        )
+        layout_cache_key = (
+            str(phase_for_step),
+            str(mode),
+            int(attempt_k),
+            bool(self.mtp_is_conf_adapt()),
+            int(a_prev_probe),
+            int(len(self.origin_input_ids)),
+            int(len(self.output_ids)),
+            canonical_enabled,
+            canonical_q_lens,
+        )
+        if (
+            self._mtp_step_layout_cache_key == layout_cache_key
+            and self._mtp_step_layout_cache_value is not None
+        ):
+            return self._mtp_step_layout_cache_value
 
         if phase_for_step == "seed":
             a_prev = 1
@@ -1013,7 +1049,6 @@ class Req(ReqDllmMixin):
             canonical_q_len = None
             canonical_q_banding_applied = False
         else:
-            pending_tokens_for_step = self.mtp_pending_tokens_for_step()
             a_prev = len(pending_tokens_for_step)
             if a_prev < 1 or a_prev > attempt_k:
                 raise ValueError(
@@ -1086,7 +1121,7 @@ class Req(ReqDllmMixin):
                 f"commit_start={commit_start}, commit_len={commit_len}, q_len={q_len}."
             )
 
-        return {
+        layout = {
             "phase": phase_for_step,
             "window_mode": mode,
             "k_max": attempt_k,
@@ -1101,6 +1136,9 @@ class Req(ReqDllmMixin):
             "canonical_q_len": canonical_q_len,
             "canonical_q_banding_applied": canonical_q_banding_applied,
         }
+        self._mtp_step_layout_cache_key = layout_cache_key
+        self._mtp_step_layout_cache_value = layout
+        return layout
 
     def mtp_attempt_k_for_step(self) -> int:
         return int(self.mtp_step_layout_for_step()["attempt_k"])
@@ -1585,6 +1623,8 @@ class Req(ReqDllmMixin):
         self.mtp_debug_last_a_prev = 0
         self.mtp_debug_last_a_cur = 0
         self.mtp_debug_last_curr_step_cache_loc = None
+        self._mtp_step_layout_cache_key = None
+        self._mtp_step_layout_cache_value = None
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -2572,6 +2612,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mtp_attempt_k_per_req = None
         self.mtp_commit_start_per_req = None
         self.mtp_commit_len_per_req = None
+        mtp_step_layouts: Optional[List[Dict[str, Any]]] = None
         if mtp_enabled_reqs:
             if get_global_server_args().attention_backend != "flashinfer":
                 raise ValueError(
@@ -2704,10 +2745,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update fields
         if mtp_enabled_reqs:
+            assert mtp_step_layouts is not None
             mask_rows = []
             for i, req in enumerate(self.reqs):
                 row = []
-                step_layout = req.mtp_step_layout_for_step()
+                step_layout = mtp_step_layouts[i]
                 phase_for_step = str(step_layout["phase"])
                 attempt_k = int(step_layout["attempt_k"])
                 recompute_len = int(step_layout["recompute_len"])
@@ -2715,9 +2757,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 commit_len = int(step_layout["commit_len"])
                 a_prev = int(step_layout["a_prev"])
                 mode_for_step = str(step_layout["window_mode"])
-                canonical_q_banding_applied = bool(
-                    step_layout.get("canonical_q_banding_applied", False)
-                )
                 pending_tokens_for_step = req.mtp_pending_tokens_for_step()
                 req.mtp_commit_len = commit_len
                 req.mtp_step_recompute_len = recompute_len
@@ -2811,43 +2850,47 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     raise ValueError(
                         f"Unexpected MTP decode row length {len(row)} for req {req.rid}, expected {token_per_req}."
                     )
-                emit_start_i, emit_len_i = req.mtp_emit_window_for_step()
-                req.mtp_debug_upsert_step(
-                    req.decode_batch_idx,
-                    {
-                        "phase": phase_for_step,
-                        "adaptive_window_mode": mode_for_step,
-                        "canonical_q_banding_applied": canonical_q_banding_applied,
-                        "canonical_q_len": step_layout.get("canonical_q_len"),
-                        "strategy_kind": req.mtp_strategy_kind,
-                        "a_prev": int(a_prev),
-                        "attempt_k_for_step": int(attempt_k),
-                        "recompute_len_for_step": int(recompute_len),
-                        "decode_k_for_step": int(recompute_len),
-                        "commit_slice": {
-                            "start": int(commit_start),
-                            "len": int(commit_len),
+                if req.mtp_debug_trace_enabled:
+                    emit_start_i = int(step_layout["emit_start"])
+                    emit_len_i = int(step_layout["emit_len"])
+                    req.mtp_debug_upsert_step(
+                        req.decode_batch_idx,
+                        {
+                            "phase": phase_for_step,
+                            "adaptive_window_mode": mode_for_step,
+                            "canonical_q_banding_applied": bool(
+                                step_layout.get("canonical_q_banding_applied", False)
+                            ),
+                            "canonical_q_len": step_layout.get("canonical_q_len"),
+                            "strategy_kind": req.mtp_strategy_kind,
+                            "a_prev": int(a_prev),
+                            "attempt_k_for_step": int(attempt_k),
+                            "recompute_len_for_step": int(recompute_len),
+                            "decode_k_for_step": int(recompute_len),
+                            "commit_slice": {
+                                "start": int(commit_start),
+                                "len": int(commit_len),
+                            },
+                            "conf_threshold": (
+                                float(req.sampling_params.mtp_conf_threshold)
+                                if req.sampling_params.mtp_conf_threshold is not None
+                                else None
+                            ),
+                            "decode_q_len_per_req": int(token_per_req),
+                            "seed_anchor_adjusted": bool(req.mtp_seed_anchor_adjusted),
+                            "kv_committed_len_effective_base": int(
+                                self.seq_lens_cpu[i].item()
+                            ),
+                            "input_row_token_ids": req._mtp_debug_cap_token_ids(row),
+                            "emit_window": {
+                                "start": int(emit_start_i),
+                                "len": int(emit_len_i),
+                            },
+                            "seq_len_base_used_for_next_decode": int(
+                                self.seq_lens_cpu[i].item()
+                            ),
                         },
-                        "conf_threshold": (
-                            float(req.sampling_params.mtp_conf_threshold)
-                            if req.sampling_params.mtp_conf_threshold is not None
-                            else None
-                        ),
-                        "decode_q_len_per_req": int(token_per_req),
-                        "seed_anchor_adjusted": bool(req.mtp_seed_anchor_adjusted),
-                        "kv_committed_len_effective_base": int(
-                            self.seq_lens_cpu[i].item()
-                        ),
-                        "input_row_token_ids": req._mtp_debug_cap_token_ids(row),
-                        "emit_window": {
-                            "start": int(emit_start_i),
-                            "len": int(emit_len_i),
-                        },
-                        "seq_len_base_used_for_next_decode": int(
-                            self.seq_lens_cpu[i].item()
-                        ),
-                    },
-                )
+                    )
                 mask_rows.append(row)
 
             self.input_ids = torch.tensor(
