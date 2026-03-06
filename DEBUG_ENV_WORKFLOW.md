@@ -53,6 +53,7 @@ exit   # leave outer login shell (if opened for this session)
 - Send commands incrementally (as typed input), and poll for prompt/output between steps.
 - Wait for `salloc` readiness message (`Nodes ... are ready for job`) before running `srun`.
 - Entering a new `srun --pty bash -li` shell resets shell-scoped exports. Re-run `sslm_sgl_env` and re-export critical vars (`MODEL_PATH`, `RUN_ROOT`, debug flags) inside that shell.
+- EAGLE3 runs must be pinned to pre-MTP commit `80760a2` (for example via worktree `sglang-mtp-lm/.worktrees/eagle3_80760a2`) and must set `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1` in both server and client shells.
 - If you use `set -u`, unset vars will abort the active step. Prefer explicit `export ...` before long command blocks.
 - `GET /health_generate` can return `503` until warmup is complete; poll with retries and also check server PID liveness to fail fast on crashes.
 - For live introspection without interrupting the main interactive step, use overlapping probes such as:

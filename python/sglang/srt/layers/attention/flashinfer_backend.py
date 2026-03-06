@@ -1847,9 +1847,12 @@ class FlashInferMultiStepDraftBackend:
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
         def call_fn(i, forward_batch):
+            # For draft multi-step EAGLE, flashinfer decode wrappers are planned
+            # against the flattened draft-token batch (num_seqs * topk).
+            effective_bs = forward_batch.batch_size * self.topk
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
+                effective_bs,
+                effective_bs,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 encoder_lens=None,
@@ -1863,8 +1866,9 @@ class FlashInferMultiStepDraftBackend:
         self, forward_batch: ForwardBatch, bs: int
     ):
         def call_fn(i, forward_batch):
+            effective_bs = bs * self.topk
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
+                effective_bs,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 seq_lens_sum=-1,
