@@ -78,6 +78,18 @@ Phase3D is a measurement-hardening phase that follows the Phase3A/3B performance
    - x = `pareto_x_latency_inv_tok_per_s_per_seq` (client per-request tok/s)
    - y = `pareto_y_throughput_tok_per_s_gpu` (server avg gen tok/s)
 
+## Adaptive Q-Len Grouping Used in Phase3D
+For the `conf_adapt` Phase3D runs, canonical q-len banding was disabled and adaptive grouping used native `hf_exact` q-lens.
+
+1. Canonical banding runtime flags in these runs were:
+   - `enable_mtp_adaptive_hf_exact_canonical_q_banding=False`
+   - `mtp_adaptive_canonical_q_lens=[]`
+2. Effective adaptive q-len capture/group sets were therefore exact ranges by `k_max`:
+   - `k_max=3`: `{3,4,5}`
+   - `k_max=8`: `{8,9,10,11,12,13,14,15}`
+   - `k_max=16`: `{16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31}`
+3. `conf_adapt` shards also captured static q-lens `{3,5}` because static `k=3` q-len graph capture was co-enabled in the shard launch profile.
+
 ## Final Results Snapshot
 Canonical merged source:
 [`outputs/phase3d_eagle3_single_20260306_185131/summary/lowc_metrics_complete_with_eagle3.tsv`](/capstor/scratch/cscs/jkirchen/sglang-mtp-lm/outputs/phase3d_eagle3_single_20260306_185131/summary/lowc_metrics_complete_with_eagle3.tsv)
