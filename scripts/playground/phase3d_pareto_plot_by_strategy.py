@@ -8,6 +8,7 @@ import csv
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +56,13 @@ def main() -> int:
     if not strategies:
         raise RuntimeError(f"No plottable rows found in {args.input_tsv}")
 
+    concurrency_values = sorted({int(row["c"]) for row in rows if row.get("c")})
+    marker_cycle = ["o", "s", "^", "D", "P", "X", "v", "<", ">", "*", "h", "8"]
+    marker_by_c = {
+        c: marker_cycle[i % len(marker_cycle)]
+        for i, c in enumerate(concurrency_values)
+    }
+
     # Use tab20, then fallback to hsv for larger sets.
     tab20 = list(plt.get_cmap("tab20").colors)
     if len(strategies) <= len(tab20):
@@ -81,22 +89,20 @@ def main() -> int:
         ax.plot(
             x,
             y,
-            marker="o",
-            markersize=7,
             linewidth=2.2,
             color=colors[idx],
             alpha=0.95,
             label=strategy,
         )
         for px, py, cval in zip(x, y, cvals):
-            ax.annotate(
-                f"c={cval}",
-                (px, py),
-                xytext=(8, 7),
-                textcoords="offset points",
-                fontsize=9,
+            ax.scatter(
+                [px],
+                [py],
+                marker=marker_by_c.get(cval, "o"),
+                s=49,
                 color=colors[idx],
-                fontweight="bold",
+                alpha=0.95,
+                zorder=3,
             )
 
     xmin, xmax = min(all_x), max(all_x)
@@ -118,18 +124,47 @@ def main() -> int:
         ax.spines[side].set_linewidth(1.2)
         ax.spines[side].set_color("#444444")
 
-    ax.legend(
+    strategy_legend = ax.legend(
         title="Strategy",
         loc="upper left",
-        bbox_to_anchor=(1.01, 1.0),
+        bbox_to_anchor=(1.00, 1.0),
+        frameon=False,
+        fontsize=12,
+        title_fontsize=13,
+    )
+    ax.add_artist(strategy_legend)
+
+    concurrency_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker=marker_by_c[c],
+            color="none",
+            markerfacecolor="#555555",
+            markeredgecolor="#555555",
+            markersize=8,
+            linestyle="None",
+            label=f"c={c}",
+        )
+        for c in concurrency_values
+    ]
+    concurrency_legend = ax.legend(
+        handles=concurrency_handles,
+        title="Concurrency",
+        loc="upper left",
+        bbox_to_anchor=(1.00, 0.48),
         frameon=False,
         fontsize=12,
         title_fontsize=13,
     )
 
     args.output_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout(rect=(0.0, 0.0, 0.84, 1.0))
-    fig.savefig(args.output_png, bbox_inches="tight")
+    fig.tight_layout(rect=(0.0, 0.0, 0.78, 1.0))
+    fig.savefig(
+        args.output_png,
+        bbox_inches="tight",
+        bbox_extra_artists=(strategy_legend, concurrency_legend),
+    )
     plt.close(fig)
 
     print(args.output_png)
@@ -138,4 +173,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
