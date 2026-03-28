@@ -15,7 +15,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 LMEVAL_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}:\d{2}:\d{2}:\d{2})")
 DECODE_RE = re.compile(
-    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] Decode batch, #running-req: (\d+),.*gen throughput \(token/s\): ([0-9]+(?:\.[0-9]+)?)"
+    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?: [^\]]+)?\] Decode batch, #running-req: (\d+),.*gen throughput \(token/s\): ([0-9]+(?:\.[0-9]+)?)"
 )
 
 
@@ -400,7 +400,7 @@ def main() -> int:
     with pareto_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=pareto_cols, delimiter="\t", lineterminator="\n")
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows({col: row.get(col, "") for col in pareto_cols} for row in rows)
 
     failure_lines = ["# Failures", ""]
     failed_rows = [r for r in rows if int(r["rc"]) != 0]

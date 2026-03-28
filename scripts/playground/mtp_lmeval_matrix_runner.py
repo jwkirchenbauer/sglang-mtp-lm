@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Sequence
 DEFAULT_TASK = "gsm8k_cot_singleshot"
 DEFAULT_CONCURRENCY = [1, 32, 64, 128]
 DEFAULT_STRATEGIES = ["non_mtp", "static_k1", "static_k2", "static_k3"]
+DEFAULT_BASE_GEN_KWARGS = ["temperature=0", "top_k=1"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,26 +92,51 @@ def parse_strategy(spec: str) -> Strategy:
     )
 
 
-def strategy_to_gen_kwargs(strategy: Strategy, mask_id: int, window_mode: str) -> str:
-    parts = ["temperature=0", "top_k=1"]
+def _normalize_gen_kwargs(raw_values: Sequence[str]) -> List[str]:
+    parts: List[str] = []
+    seen: Dict[str, str] = {}
+    for raw in raw_values:
+        for item in str(raw).split(","):
+            part = item.strip()
+            if not part:
+                continue
+            key, sep, _ = part.partition("=")
+            key = key.strip()
+            if not sep or not key:
+                raise ValueError(f"Invalid gen_kwargs entry: {part!r}")
+            if key in seen:
+                raise ValueError(
+                    f"Duplicate gen_kwargs key {key!r}: {seen[key]!r} and {part!r}"
+                )
+            seen[key] = part
+            parts.append(part)
+    return parts
+
+
+def strategy_to_gen_kwargs(
+    strategy: Strategy,
+    mask_id: int,
+    window_mode: str,
+    base_parts: Sequence[str],
+) -> str:
+    parts = list(base_parts)
     if strategy.family == "non_mtp":
         return ",".join(parts)
 
-    parts.extend(
-        [
-            "mtp_enabled=true",
-            f"mtp_k={strategy.k}",
-            f"mtp_mask_id={mask_id}",
-        ]
-    )
+    mtp_parts = [
+        "mtp_enabled=true",
+        f"mtp_k={strategy.k}",
+        f"mtp_mask_id={mask_id}",
+    ]
     if strategy.family == "conf_adapt":
         assert strategy.threshold is not None
-        parts.extend(
+        mtp_parts.extend(
             [
                 f"mtp_strategy=conf_adapt+{strategy.threshold}",
                 f"mtp_adaptive_window_mode={window_mode}",
             ]
         )
+    parts.extend(_normalize_gen_kwargs(mtp_parts))
     return ",".join(parts)
 
 
@@ -149,6 +175,15 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Pass-through extra args to lm_eval. Repeatable.",
+    )
+    parser.add_argument(
+        "--base-gen-kwargs",
+        action="append",
+        default=[],
+        help=(
+            "Shared lm_eval --gen_kwargs entries applied to every case before any "
+            "strategy-specific MTP keys. Repeatable and/or comma-separated."
+        ),
     )
     parser.add_argument(
         "--disable-chat-template",
@@ -256,6 +291,9 @@ def run_case(
         strategy=strategy,
         mask_id=int(args.mask_id),
         window_mode=str(args.adaptive_window_mode),
+        base_parts=_normalize_gen_kwargs(
+            args.base_gen_kwargs or DEFAULT_BASE_GEN_KWARGS
+        ),
     )
 
     cmd: List[str] = [
@@ -316,6 +354,7 @@ def validate_args(args: argparse.Namespace, strategies: Sequence[Strategy]) -> N
         raise ValueError("--concurrency values must be unique.")
     if len(strategies) == 0:
         raise ValueError("At least one strategy must be provided.")
+    _normalize_gen_kwargs(args.base_gen_kwargs or DEFAULT_BASE_GEN_KWARGS)
 
 
 def main() -> int:
@@ -342,6 +381,9 @@ def main() -> int:
         "adaptive_window_mode": str(args.adaptive_window_mode),
         "concurrency": [int(x) for x in args.concurrency],
         "strategies": [dataclasses.asdict(s) for s in strategies],
+        "base_gen_kwargs": _normalize_gen_kwargs(
+            args.base_gen_kwargs or DEFAULT_BASE_GEN_KWARGS
+        ),
         "extra_lm_eval_arg": list(args.extra_lm_eval_arg),
         "disable_chat_template": bool(args.disable_chat_template),
         "dry_run": bool(args.dry_run),
