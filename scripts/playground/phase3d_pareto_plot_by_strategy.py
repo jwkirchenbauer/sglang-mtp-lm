@@ -504,7 +504,7 @@ def main() -> int:
     if args.title:
         ax.set_title(args.title, fontsize=TITLE_FONTSIZE, fontweight="normal", pad=18)
     ax.set_xlabel(r"Latency$^{-1}$ (tok/sec/sequence)", fontsize=AXIS_LABEL_FONTSIZE, fontweight="normal", labelpad=X_LABELPAD)
-    ax.set_ylabel("Throughput (tok/sec/GPU)", fontsize=AXIS_LABEL_FONTSIZE, fontweight="normal", labelpad=Y_LABELPAD)
+    ax.set_ylabel("Throughput (tok/sec)", fontsize=AXIS_LABEL_FONTSIZE, fontweight="normal", labelpad=Y_LABELPAD)
     ax.grid(True, linestyle=":", alpha=0.6, color="#9a9a9a", linewidth=0.8)
     ax.tick_params(axis="both", labelsize=AXIS_TICK_FONTSIZE)
 
@@ -609,7 +609,7 @@ def main() -> int:
         for c in concurrency_values
     ]
     concurrency_legend = fig.legend(
-        handles=concurrency_handles,
+        handles=concurrency_handles[::-1],
         title="Concurrency",
         loc="upper center",
         bbox_to_anchor=(
